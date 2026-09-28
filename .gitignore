@@ -1,0 +1,76 @@
+# =============================================================================
+#  RAMstain .gitignore
+#  Excludes personal notes, build artifacts, memory-capture outputs, and IDE
+#  state. Source, project/solution files, and the icon/manifest are tracked.
+# =============================================================================
+
+# --- Personal notes / scratch ------------------------------------------------
+notes.txt
+
+# --- Visual Studio / MSBuild build output -----------------------------------
+# Compiled binaries and intermediate files (never commit build products)
+[Oo]bj/
+[Bb]in/
+x64/
+x86/
+Debug/
+Release/
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+*.ipdb
+*.iobj
+*.idb
+*.tlog
+*.exp
+*.lib
+*.dll
+*.map
+*.manifest.*
+
+# MSVC incremental / LTCG intermediates
+*.sdf
+*.vc.db
+*.vc.opendb
+
+# Visual Studio user + workspace state
+.vs/
+*.user
+*.aps
+*.aps.log
+ipch/
+[Dd]ebug*/
+*.idc
+*.ncb
+*.suo
+*.sdf
+*.VC.db
+*.VC.db.wal
+
+# --- Memory capture outputs (forensic evidence - do NOT commit) --------------
+# Raw memory images and their metadata sidecars can be multi-GB and contain
+# sensitive data. Never put them in version control.
+*.raw
+*.dmp
+*.mem
+*.memimage
+*.meta
+*.vmem
+*.pmem
+
+# Test/working output directory (memory captures, debug output)
+test/
+
+# Tools / diagnostics (probe & helper scripts - keep out of the repo)
+tools/
+
+# --- Editor / OS noise -------------------------------------------------------
+*.tmp
+*.bak
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
