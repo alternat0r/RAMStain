@@ -56,6 +56,7 @@
 #define IDC_BTN_PRIV     1006
 #define IDC_BTN_TERMS    1007
 #define IDC_PROGRESS     1008
+#define IDC_CHK_TOP      1009
 
 #define IDC_SUB_TEXT     2001
 #define IDC_SUB_PRIMARY  2002
@@ -73,15 +74,13 @@ static const wchar_t* kVersionStr  = L"1.0.0";
 //  Theme (light, flat, modern)
 // ---------------------------------------------------------------------------
 struct Theme {
-    COLORREF bg, header, headerSub, card, cardBorder, text, muted, label;
+    COLORREF bg, header, headerSub, text, muted, label;
     COLORREF accent, accentHover, accentDown, secBorder, secText, secFill;
     COLORREF danger, dangerHover, dangerDown, ok, white, disabledFill, disabledText;
     Theme() {
         bg           = RGB(248, 250, 252);
         header       = RGB(15, 23, 42);
         headerSub    = RGB(148, 163, 184);
-        card         = RGB(255, 255, 255);
-        cardBorder   = RGB(226, 232, 240);
         text         = RGB(15, 23, 42);
         muted        = RGB(100, 116, 139);
         label        = RGB(100, 116, 139);
@@ -102,17 +101,18 @@ struct Theme {
 };
 static Theme C;
 
-static HBRUSH g_brBg = nullptr, g_brCard = nullptr, g_brHeader = nullptr, g_brWhite = nullptr;
-static HPEN   g_penCardBorder = nullptr, g_penEditBorder = nullptr, g_penNull = nullptr;
+static HBRUSH g_brBg = nullptr, g_brHeader = nullptr, g_brWhite = nullptr;
+static HPEN   g_penEditBorder = nullptr, g_penNull = nullptr;
 static HFONT  g_fTitle = nullptr, g_fBody = nullptr, g_fLabel = nullptr, g_fSmall = nullptr, g_fEdit = nullptr;
 static HICON  g_hIcon = nullptr;
 
 static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
-              g_btnDisc, g_btnPriv, g_btnTerms;
+              g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop;
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
 static bool   g_selftest  = false;
+static bool   g_topmost   = false;   // "Always on top" (default off)
 static std::wstring g_cliPath;
 
 static std::wstring g_status;        // status line text
@@ -811,10 +811,6 @@ static void DrawMain(HDC dc, HWND hwnd) {
     DrawTextW(dc, sub.c_str(), -1, &sr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, g_fBody);
 
-    // Card
-    RECT card = { Sc(16, dpi), Sc(80, dpi), W - Sc(16, dpi), Sc(336, dpi) };
-    DrawRoundRect(dc, card, Sc(10, dpi), g_brCard, g_penCardBorder);
-
     auto label = [&](int x, int y, const wchar_t* s) {
         HFONT of = (HFONT)SelectObject(dc, g_fLabel);
         SetTextColor(dc, C.label);
@@ -833,7 +829,14 @@ static void DrawMain(HDC dc, HWND hwnd) {
     // Save location
     label(Sc(32, dpi), Sc(96, dpi), L"SAVE LOCATION");
     RECT er = { Sc(32, dpi), Sc(116, dpi), Sc(484, dpi), Sc(148, dpi) };
-    DrawRoundRect(dc, er, Sc(7, dpi), (HBRUSH)GetStockObject(NULL_BRUSH), g_penEditBorder);
+    // Flat (square-cornered) field outline - no rounded "card" look.
+    {
+        HPEN op = (HPEN)SelectObject(dc, g_penEditBorder);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, (HBRUSH)GetStockObject(NULL_BRUSH));
+        Rectangle(dc, er.left, er.top, er.right, er.bottom);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+    }
 
     // System info grid
     double gb = GetTotalRamGB();
@@ -877,8 +880,8 @@ static void DrawMain(HDC dc, HWND hwnd) {
     {
         HFONT of3 = (HFONT)SelectObject(dc, g_fSmall);
         SetTextColor(dc, C.muted);
-        RECT vr = { Sc(32, dpi), Sc(402, dpi), W - Sc(32, dpi), Sc(424, dpi) };
-        DrawTextW(dc, (std::wstring(L"v") + kVersionStr + L"   offline - no data is transmitted").c_str(),
+        RECT vr = { Sc(16, dpi), Sc(402, dpi), Sc(150, dpi), Sc(424, dpi) };
+        DrawTextW(dc, (std::wstring(L"v") + kVersionStr).c_str(),
                   -1, &vr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, of3);
     }
@@ -1064,6 +1067,32 @@ static void OnLegalDoc(int which) {
 }
 
 // ---------------------------------------------------------------------------
+//  Drag-to-move from anywhere in the form (empty parent areas).
+//
+//  Manual drag: on a left-button-down that lands on the parent's own surface
+//  (not on a child control), take mouse capture and move the window to follow
+//  the cursor; release on button-up. Interactive children (edit, checkbox,
+//  owner-drawn buttons, progress bar) consume their own mouse messages, so a
+//  press on them is NOT a drag and keeps working normally. This covers the
+//  header band, card surface, labels, status and footer gap - effectively the
+//  whole non-control area of the form.
+// ---------------------------------------------------------------------------
+static POINT  g_dragCursor;  // screen coords at drag start
+static POINT  g_dragWinPos;  // window top-left at drag start
+static bool   g_dragging = false;
+
+static void DragMoveWindow(HWND hwnd) {
+    // Move the window by the same delta the cursor has moved since drag start
+    // (g_dragCursor / g_dragWinPos were captured at WM_LBUTTONDOWN).
+    POINT cur;
+    GetCursorPos(&cur);
+    SetWindowPos(hwnd, nullptr,
+                 g_dragWinPos.x + (cur.x - g_dragCursor.x),
+                 g_dragWinPos.y + (cur.y - g_dragCursor.y),
+                 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+}
+
+// ---------------------------------------------------------------------------
 //  Main window procedure
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1121,6 +1150,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 BtnStyle::Link, (HMENU)IDC_BTN_TERMS, g_fSmall, dpi);
 
         g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(101), IMAGE_ICON, Sc(36, dpi), Sc(36, dpi), 0);
+
+        // "Always on top" checkbox (footer, default off).
+        g_chkTop = CreateWindowExW(0, L"BUTTON", L"Always on top",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                   Sc(156, dpi), Sc(401, dpi), Sc(124, dpi), Sc(24, dpi),
+                                   hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
+        SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
+
         g_status = L"Ready.";
         g_statusColor = C.muted;
         return 0;
@@ -1158,13 +1196,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BTN_DISC:    OnLegalDoc(IDC_BTN_DISC); return 0;
         case IDC_BTN_PRIV:    OnLegalDoc(IDC_BTN_PRIV); return 0;
         case IDC_BTN_TERMS:   OnLegalDoc(IDC_BTN_TERMS); return 0;
+        case IDC_CHK_TOP: {
+            g_topmost = (SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SetWindowPos(hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                         0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            return 0;
+        }
         case IDOK:
         case IDCANCEL:        OnCloseButton(); return 0;
         }
         return 0;
     }
+    case WM_LBUTTONDOWN:
+        // Drag the window when the press lands on the parent's own (empty)
+        // area. Child controls (edit, checkbox, buttons, progress bar) consume
+        // their own WM_LBUTTONDOWN, so this only fires for blank space - the
+        // header band, card surface, labels, status and footer gap.
+        GetCursorPos(&g_dragCursor);
+        {
+            RECT wr;
+            GetWindowRect(hwnd, &wr);
+            g_dragWinPos.x = wr.left;
+            g_dragWinPos.y = wr.top;
+        }
+        g_dragging = true;
+        SetCapture(hwnd);
+        return 0;
     case WM_MOUSEMOVE:
+        if (g_dragging)
+            DragMoveWindow(hwnd);
         TrackHover(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        return 0;
+    case WM_LBUTTONUP:
+        if (g_dragging) {
+            g_dragging = false;
+            ReleaseCapture();
+        }
         return 0;
     case WM_APP_PROGRESS:
         SendMessageW(g_progress, PBM_SETPOS, (WPARAM)wp, 0);
@@ -1207,20 +1274,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ---------------------------------------------------------------------------
 static void CreateThemeGfx() {
     g_brBg = CreateSolidBrush(C.bg);
-    g_brCard = CreateSolidBrush(C.card);
     g_brHeader = CreateSolidBrush(C.header);
     g_brWhite = CreateSolidBrush(C.white);
-    g_penCardBorder = CreatePen(PS_SOLID, 1, C.cardBorder);
     g_penEditBorder = CreatePen(PS_SOLID, 1, RGB(203, 213, 225));
     g_penNull = (HPEN)GetStockObject(NULL_PEN);
 }
 
 static void DestroyThemeGfx() {
     if (g_brBg) DeleteObject(g_brBg);
-    if (g_brCard) DeleteObject(g_brCard);
     if (g_brHeader) DeleteObject(g_brHeader);
     if (g_brWhite) DeleteObject(g_brWhite);
-    if (g_penCardBorder) DeleteObject(g_penCardBorder);
     if (g_penEditBorder) DeleteObject(g_penEditBorder);
     for (HFONT f : { g_fTitle, g_fBody, g_fLabel, g_fSmall, g_fEdit })
         if (f) DeleteObject(f);
