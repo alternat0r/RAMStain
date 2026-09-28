@@ -136,7 +136,7 @@ contain local captures and helper scripts.
 RAMstain capture metadata
 =========================
 Image:       D:\evidence\host1.raw
-Host:        KAMIL-MY
+Host:        WS-FORENSICS-01
 OS:          Windows 10.0 build 26200
 Kernel:      NT 10.0.26200
 Captured:    20260928_163614 (local time)
