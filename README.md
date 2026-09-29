@@ -12,10 +12,16 @@ single EXE that you run and that writes the dump straight to a path you choose.
 
 ## What it does
 
-RAMstain captures the entire contents of physical RAM using the **Win32
-Physical Memory Handle API** (`OpenProcess` on the physical-memory
-pseudo-process + `ReadProcessMemory`). It is the same driverless technique
-used by WinPMEM's raw mode — no kernel driver, no service, no install.
+RAMstain captures the entire contents of physical RAM using the official,
+signed **Velocidex WinPmem** imager (`go-winpmem-signed.exe`). The imager
+temporarily loads its signed kernel driver, writes the image, and unloads the
+driver again. RAMstain drives it from a simple UI and adds the MD5 digest and
+evidence sidecar described below. Nothing is installed permanently.
+
+An **experimental driverless path** (`OpenProcess` on PID -1 +
+`ReadProcessMemory`) is still available by unticking **Use WinPmem driver**,
+but it is not a documented Windows API and is expected to fail. See
+[Capture methods](#capture-methods).
 
 For each capture it produces two files in the location you specify:
 
@@ -24,14 +30,14 @@ For each capture it produces two files in the location you specify:
 | `<name>.raw`  | The physical memory image, 4 KiB page-aligned. |
 | `<name>.meta` | An evidence sidecar: image path, host name, OS + kernel build, capture timestamp, byte size, page count, MD5 digest, tool version, and method. |
 
-A running **MD5** digest is computed as the image is streamed to disk (the same
-convention WinPMEM uses for integrity), and is written to both the completion
-dialog and the `.meta` sidecar.
+An **MD5** digest of the finished image (the same convention WinPMEM uses for
+integrity) is written to both the completion dialog and the `.meta` sidecar.
 
 ## Key properties
 
-- **Single self-contained EXE.** Statically linked (no VC++ runtime / MFC /
-  redistributable required). ~220 KB.
+- **Small, self-contained EXE.** Statically linked (no VC++ runtime / MFC /
+  redistributable required). ~220 KB. Needs the WinPmem imager
+  (`go-winpmem-signed.exe`) placed next to it for real captures.
 - **Offline by design.** No network calls, no telemetry, no update downloads.
 - **Runs as Administrator** (required to read physical memory).
 - **Progress + Stop.** Live progress bar; the **Close** button becomes **Stop**
@@ -51,8 +57,8 @@ dialog and the `.meta` sidecar.
 Requires **Visual Studio 2022** (C++ core tools, x64).
 
 ```bat
-build.cmd            :: Release x64  ->  x64\Release\RAMstain.exe
-build.cmd Debug      :: Debug  x64  ->  x64\Debug\RAMstain.exe
+build.bat            :: Release x64  ->  x64\Release\RAMstain.exe
+build.bat Debug      :: Debug  x64  ->  x64\Debug\RAMstain.exe
 ```
 
 Or in Visual Studio: open `RAMstain.sln` → select **Release | x64** → Build.
@@ -63,47 +69,55 @@ Or in Visual Studio: open `RAMstain.sln` → select **Release | x64** → Build.
 RAMstain.exe
 ```
 
-1. Choose the output path (default is `RAMstain_<timestamp>.raw` next to the
+1. Download `go-winpmem-signed.exe` from the
+   [WinPmem releases](https://github.com/Velocidex/WinPmem/releases) and place
+   it next to `RAMstain.exe`.
+2. Choose the output path (default is `RAMstain_<timestamp>.raw` next to the
    EXE). Use **Browse…** to pick a different location.
-2. Click **Capture**. RAMstain self-elevates (UAC) and streams the image to
-   disk, showing live progress.
-3. On completion you get a summary dialog (size, time, speed, MD5) and the
+3. Click **Capture**. RAMstain runs as Administrator (UAC prompt at launch),
+   runs the imager, and shows live progress as the image grows.
+4. On completion you get a summary dialog (size, time, speed, MD5) and the
    option to open the folder.
 
 ### Command line
 
 ```
-RAMstain.exe "D:\evidence\host1.raw"     :: pre-fill the save path
-RAMstain.exe --selftest "C:\out\test.raw":: run a 512 MiB synthetic pipeline test
+RAMstain.exe "D:\evidence\host1.raw"                  :: pre-fill the save path
+RAMstain.exe --driver "C:\tools\go-winpmem-signed.exe" :: use an imager from another location
+RAMstain.exe --no-driver                              :: start with the experimental driverless path selected
+RAMstain.exe --selftest "C:\out\test.raw"             :: run a 512 MiB synthetic pipeline test
 ```
 
-`--selftest` writes a known synthetic 512 MiB image through the exact same
-write → MD5 → sidecar → dialog pipeline used for real captures. It is a way to
+The imager is looked up in this order: `--driver <path>`, then
+`go-winpmem-signed.exe` / `go-winpmem.exe` / `winpmem-go.exe` next to
+`RAMstain.exe`, then the `RAMSTAIN_WINPMEM` environment variable, then
+`C:\RAMstain\go-winpmem-signed.exe`.
+
+`--selftest` writes a known synthetic 512 MiB image through the same
+write → MD5 → sidecar → dialog pipeline as the driverless path. It is a way to
 verify the tool, disk, and MD5 path work end-to-end **without** capturing real
-memory (useful on machines where the OS blocks physical-memory reads — see
-below). The `.meta` sidecar is clearly marked `SELF-TEST synthetic source`.
+memory. The `.meta` sidecar is clearly marked `SELF-TEST synthetic source`.
 
 ---
 
-## Platform compatibility (important)
+## Capture methods
 
-The driverless physical-memory handle API works on **standard Windows 10** and
-**Windows 11 (23H2 and earlier)** when run as Administrator.
+**WinPmem driver (default).** Reading physical memory on Windows requires
+kernel code, so the supported method is the signed WinPmem driver. During a
+capture the imager creates a temporary `winpmem` service, loads the driver,
+writes the image, and removes the service again. RAMstain also runs the
+imager's `uninstall` command afterwards as a safety net. Security products or
+driver-blocking policies (e.g. HVCI / the vulnerable-driver blocklist) can
+prevent the driver from loading; check Event Viewer if a capture produces no
+image.
 
-Starting with certain hardened Windows 11 builds (reported on **24H2/25H2**,
-e.g. build 26200), Microsoft restricts `OpenProcess` on the physical-memory
-pseudo-process even for an elevated token. On those systems RAMstain **will not
-be able to capture physical memory** — it detects this and explains it, rather
-than failing silently. Options in that case:
-
-1. Run RAMstain on a Windows 10 / 11 (≤23H2) host.
-2. Use a kernel-driver method (e.g. WinPMEM with a signed driver, or DumpIt) —
-   requires a reboot and installing a signed kernel driver.
-3. Capture inside a VM and image the guest's RAM.
-
-You can check whether a given machine is affected simply by running
-`RAMstain.exe` and clicking Capture: the error message will tell you if the OS
-blocked physical-memory access (error 87).
+**Driverless (experimental).** Unticking **Use WinPmem driver** (or passing
+`--no-driver`) tries `OpenProcess` on PID -1 followed by `ReadProcessMemory`.
+This is **not** a documented Windows API. On Windows 11 build 26200,
+`OpenProcess(-1)` fails with error 87 (`ERROR_INVALID_PARAMETER`), exactly the
+same error Windows returns for any process ID that does not exist. No Windows
+version is known where this path captures memory. It is kept only so it can be
+tested on other systems.
 
 ---
 
@@ -112,7 +126,7 @@ blocked physical-memory access (error 87).
 ```
 RAMstain.sln            Visual Studio solution
 RAMstain.vcxproj        project (v143 / x64, static CRT, UAC + themed manifest)
-build.cmd               one-line MSBuild wrapper
+build.bat               MSBuild wrapper (app + local tools)
 src/
   RAMstain.cpp          the entire application (UI + capture engine)
   md5.h                 small self-contained MD5 (for capture integrity only)
@@ -144,7 +158,7 @@ Size:        34359738368 bytes
 Pages:       8388608 x 4096 bytes
 MD5:         2ea471360b0e7eecd12e9f61a5d2649c
 Tool:        RAMstain 1.0.0
-Method:      Win32 Physical Memory Handle API (no driver, no network)
+Method:      WinPmem kernel driver (Velocidex signed driver)
 ```
 
 ---

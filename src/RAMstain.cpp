@@ -1,10 +1,15 @@
 // ============================================================================
 //  RAMstain - Compact Physical Memory Capture (Win32, zero dependencies)
 //
-//  Captures physical RAM using the Win32 Physical Memory Handle API
-//  (OpenProcess on PID -1 / PAGE_READ_MEMORY) - the same technique used by
-//  WinPMEM's raw mode. No kernel driver, no service, no registration, no
+//  Captures physical RAM via the signed Velocidex WinPmem imager (default):
+//  the imager loads its signed kernel driver, writes the image, and unloads.
+//  RAMstain adds the MD5 + .meta evidence sidecar. No registration, no
 //  account, no network. Offline by design.
+//
+//  An experimental driverless path (OpenProcess(PID -1) + ReadProcessMemory)
+//  is kept as an opt-in fallback. It is not a documented Windows API: on
+//  current Windows, OpenProcess(-1) fails with error 87 exactly as it does for
+//  any nonexistent PID, so expect it to fail.
 //
 //  Output:
 //    <name>.raw   physical memory image, 4 KiB page-aligned
@@ -15,6 +20,8 @@
 //
 //  CLI:
 //    RAMstain.exe ["C:\path\to\dump.raw"]     pre-fill the save path
+//    RAMstain.exe --driver <imager.exe>       use an explicit WinPmem imager
+//    RAMstain.exe --no-driver                 start with the driverless path selected
 //    RAMstain.exe --selftest ["C:\path\out"]  synthetic 512 MiB pipeline test
 //
 //  Build: MSVC (Visual Studio 2022), x64, static CRT
@@ -116,10 +123,10 @@ static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
 static bool   g_selftest  = false;
 static bool   g_topmost   = false;   // "Always on top" (default off)
-static bool   g_driverMode = false;  // "Use WinPmem driver" (default off)
+static bool   g_driverMode = false;  // resolved per capture from the "Use WinPmem driver" checkbox
+static bool   g_driverDefault = true;// initial checkbox state (on; --no-driver turns it off)
 static bool   g_driverWarned = false;// show the driver warning once per session
 static std::wstring g_driverPath;    // explicit imager path from --driver <path>
-static bool   g_cliDriver = false;   // --driver was passed on the command line
 static std::wstring g_cliPath;
 
 static std::wstring g_status;        // status line text
@@ -140,7 +147,7 @@ struct CaptureResult {
     std::string  md5;
     std::wstring path;
     std::wstring metaPath;
-    std::wstring method;             // "Win32 Physical Memory Handle API" or "WinPmem kernel driver"
+    std::wstring method;             // "WinPmem kernel driver ..." (empty = driverless path)
 };
 static CaptureResult* g_activeResult = nullptr;
 
@@ -339,7 +346,7 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
         L"Method:      " + (selftest
             ? std::wstring(L"SELF-TEST synthetic source (not a memory capture)\n")
             : (res->method.empty()
-                ? std::wstring(L"Win32 Physical Memory Handle API (no driver, no network)\n")
+                ? std::wstring(L"Driverless OpenProcess(PID -1) + ReadProcessMemory (experimental)\n")
                 : (res->method + L"\n"))) +
         (res->cancelled ? L"Note:        Capture stopped by user (partial image)\n" : L"");
     std::string metaUtf8 = WideToUtf8(meta);
@@ -381,21 +388,14 @@ static void RunCapture(CaptureResult* res, bool selftest) {
             std::wstring os = GetOsVersionString();
             if (code == ERROR_INVALID_PARAMETER) {
                 res->error =
-                    L"Windows rejected physical-memory access.\n"
-                    L"Error 87 (ERROR_INVALID_PARAMETER) on OpenProcess(physical memory).\n\n"
-                    L"This system - " + os +
-                    L" - blocks the driverless physical-memory API at the OS level "
-                    L"(Windows 11 24H2/25H2 hardened the kernel against "
-                    L"OpenProcess(PID -1), even for an elevated token with SeDebugPrivilege).\n\n"
-                    L"On a standard Windows 10 or Windows 11 23H2 or earlier machine the "
-                    L"same executable captures full physical RAM with no driver.\n\n"
-                    L"Options on this machine:\n"
-                    L"  1. Run RAMstain on a Windows 10 / 11 (<=23H2) system.\n"
-                    L"  2. Use a kernel-driver method (e.g. WinPMEM with a signed "
-                    L"driver, or DumpIt) - requires a reboot and a signed kernel "
-                    L"driver to be installed.\n"
-                    L"  3. Use a VM: boot this machine's disk in a VM and capture "
-                    L"the VM's RAM (guest is then a non-hardened OS).";
+                    L"The experimental driverless method is not available on this system.\n"
+                    L"OpenProcess(PID -1) failed with error 87 (ERROR_INVALID_PARAMETER) "
+                    L"on " + os + L".\n\n"
+                    L"Error 87 is what Windows returns for any process ID that does not "
+                    L"exist; PID -1 is not a documented physical-memory handle.\n\n"
+                    L"Use the WinPmem driver instead: tick 'Use WinPmem driver' and place "
+                    L"'go-winpmem-signed.exe' next to RAMstain.exe.\n"
+                    L"Download: https://github.com/Velocidex/WinPmem/releases";
             } else if (code == ERROR_ACCESS_DENIED) {
                 res->error =
                     L"Physical-memory access denied (error " +
@@ -496,8 +496,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 }
 
 // ---------------------------------------------------------------------------
-//  Optional WinPmem driver fallback (for hardened OS builds where the driverless
-//  handle API is blocked, e.g. Windows 11 24H2/25H2).
+//  WinPmem driver capture (the default method).
 //
 //  Shells out to the official signed Velocidex WinPmem Go imager, which embeds
 //  its own signed kernel driver: it installs/starts the service, writes the
@@ -728,9 +727,9 @@ static DWORD WINAPI CaptureThreadProc(LPVOID arg) {
         msPerTick = 1000.0 / (double)qf.QuadPart;
 
     if (g_driverMode && !g_selftest)
-        RunDriverCapture(res);          // optional WinPmem signed-driver path
+        RunDriverCapture(res);          // default: WinPmem signed-driver path
     else
-        RunCapture(res, g_selftest);    // default driverless path (or synthetic self-test)
+        RunCapture(res, g_selftest);    // experimental driverless path (or synthetic self-test)
 
     QueryPerformanceCounter(&t1);
     res->seconds = msPerTick > 0 ? ((double)(t1.QuadPart - t0.QuadPart) * msPerTick) / 1000.0
@@ -1237,10 +1236,7 @@ static void OnCapture() {
         SetTextW(g_editPath, path);
     }
 
-    // Driver mode (optional): checkbox OR --driver on the command line.
-    bool cliChecked = g_cliDriver;
-    if (cliChecked)
-        SendMessageW(g_chkDriver, BM_SETCHECK, BST_CHECKED, 0);
+    // Driver mode (default): the checkbox, initialised from the command line.
     g_driverMode = (!g_selftest &&
                     (SendMessageW(g_chkDriver, BM_GETCHECK, 0, 0) == BST_CHECKED));
     if (g_driverMode && FindWinPmemImager().empty()) {
@@ -1252,9 +1248,9 @@ static void OnCapture() {
             L"  • pass it:  RAMstain.exe --driver C:\\path\\go-winpmem-signed.exe\n"
             L"  • set the RAMSTAIN_WINPMEM environment variable to its full path.\n\n"
             L"Download: https://github.com/Velocidex/WinPmem/releases\n\n"
-            L"You can capture now without the driver, but on Windows 11 24H2/25H2 "
-            L"the driverless method is usually blocked by the OS.",
-            L"OK", L"Capture without driver", L"", 520, 360);
+            L"You can try the experimental driverless method instead, but it is "
+            L"not a documented Windows API and is expected to fail.",
+            L"OK", L"Try driverless", L"", 520, 360);
         if (r == 2) {
             g_driverMode = false;               // proceed driverless
             SendMessageW(g_chkDriver, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -1494,13 +1490,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // "Use WinPmem driver" checkbox - in the button row, to the right of
         // the Close/Stop button (which ends at x=314), so it never overlaps.
         // Vertically centered on the 38px-tall buttons (y=352..390).
+        // Default on (the driver is the primary method); --no-driver clears it.
         g_chkDriver = CreateWindowExW(0, L"BUTTON",
-                                      L"Use WinPmem driver (24H2/25H2)",
+                                      L"Use WinPmem driver (recommended)",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                       Sc(320, dpi), Sc(359, dpi), Sc(268, dpi), Sc(24, dpi),
                                       hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
         SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        SendMessageW(g_chkDriver, BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageW(g_chkDriver, BM_SETCHECK,
+                     (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
 
         g_status = L"Ready.";
         g_statusColor = C.muted;
@@ -1666,14 +1664,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 g_selftest = true;
             } else if (_wcsicmp(t.c_str(), L"--driver-mode") == 0 ||
                        _wcsicmp(t.c_str(), L"--driver") == 0) {
-                g_cliDriver = true;                       // enable driver mode
+                g_driverDefault = true;                   // driver mode (already the default)
                 if (_wcsicmp(t.c_str(), L"--driver") == 0 &&
                     k + 1 < toks.size() && toks[k + 1][0] != L'-') {
                     g_driverPath = toks[k + 1];            // optional explicit imager path
                     ++k;
                 }
             } else if (_wcsicmp(t.c_str(), L"--no-driver") == 0) {
-                g_cliDriver = false;                       // explicitly disable
+                g_driverDefault = false;                   // start with driverless selected
             } else if (g_cliPath.empty()) {
                 g_cliPath = t;
                 TrimRight(g_cliPath);
