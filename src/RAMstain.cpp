@@ -229,7 +229,7 @@ static double GetTotalRamGB() {
 
 static std::wstring GetComputerName() {
     wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1] = L"";
-    DWORD n = MAX_COMPUTERNAME_LENGTH;
+    DWORD n = _countof(buf);   // buffer size incl. the terminating NUL
     if (GetComputerNameW(buf, &n)) return std::wstring(buf, n);
     return L"unknown";
 }
@@ -1208,14 +1208,17 @@ static void OnBrowse() {
     ofn.hwndOwner = g_hwnd;
     ofn.lpstrFilter = L"Memory image (*.raw)\0*.raw\0All files (*.*)\0*.*\0";
     ofn.nFilterIndex = 1;
-    std::wstring wb(path);
-    if (wb.size() >= MAX_PATH) wb = DefaultDumpPath();
-    ofn.lpstrFile = &wb[0];
-    ofn.nMaxFile = (DWORD)wb.size();
+    // Fixed, generously sized buffer: the dialog writes the chosen path back
+    // into it, which may be longer than the current one (the manifest is
+    // longPathAware, so allow long paths too).
+    std::vector<wchar_t> fileBuf(32768, L'\0');
+    wcsncpy_s(fileBuf.data(), fileBuf.size(), path.c_str(), _TRUNCATE);
+    ofn.lpstrFile = fileBuf.data();
+    ofn.nMaxFile = (DWORD)fileBuf.size();
     ofn.lpstrDefExt = L"raw";
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (GetSaveFileNameW(&ofn))
-        SetTextW(g_editPath, wb);
+        SetTextW(g_editPath, fileBuf.data());
 }
 
 static void OnCapture() {
@@ -1477,7 +1480,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btnTerms = MakeButton(hwnd, L"Terms of Use", Sc(506, dpi), Sc(402, dpi), Sc(92, dpi), Sc(24, dpi),
                                 BtnStyle::Link, (HMENU)IDC_BTN_TERMS, g_fSmall, dpi);
 
-        g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(101), IMAGE_ICON, Sc(36, dpi), Sc(36, dpi), 0);
+        g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, Sc(36, dpi), Sc(36, dpi), 0);
 
         // "Always on top" checkbox (footer, default off).
         g_chkTop = CreateWindowExW(0, L"BUTTON", L"Always on top",
@@ -1577,6 +1580,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_dragging = false;
             ReleaseCapture();
         }
+        return 0;
+    case WM_CAPTURECHANGED:
+        // Capture taken away mid-drag (Alt-Tab, a dialog, another window
+        // grabbing the mouse): end the drag, otherwise g_dragging stays set
+        // and the window would follow the mouse on the next move.
+        g_dragging = false;
         return 0;
     case WM_APP_PROGRESS:
         SendMessageW(g_progress, PBM_SETPOS, (WPARAM)wp, 0);
