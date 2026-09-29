@@ -37,6 +37,7 @@
 #include <cstdint>
 #include "md5.h"
 #include "legal.h"
+#include "resource.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -192,7 +193,7 @@ static std::wstring MakeTimestamp() {
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t b[32];
-    _snwprintf_s(b, sizeof(b), _TRUNCATE, L"%04d%02d%02d_%02d%02d%02d",
+    _snwprintf_s(b, _countof(b), _TRUNCATE, L"%04d%02d%02d_%02d%02d%02d",
                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     return b;
 }
@@ -264,9 +265,9 @@ static std::wstring FormatDuration(double sec) {
     int m = (int)(sec / 60.0) % 60;
     int s = (int)(sec) % 60;
     wchar_t b[48];
-    if (h > 0) _snwprintf_s(b, sizeof(b), _TRUNCATE, L"%dh %dm %ds", h, m, s);
-    else if (m > 0) _snwprintf_s(b, sizeof(b), _TRUNCATE, L"%dm %ds", m, s);
-    else _snwprintf_s(b, sizeof(b), _TRUNCATE, L"%ds", s);
+    if (h > 0) _snwprintf_s(b, _countof(b), _TRUNCATE, L"%dh %dm %ds", h, m, s);
+    else if (m > 0) _snwprintf_s(b, _countof(b), _TRUNCATE, L"%dm %ds", m, s);
+    else _snwprintf_s(b, _countof(b), _TRUNCATE, L"%ds", s);
     return b;
 }
 
@@ -551,6 +552,9 @@ static UINT64 GetFileBytes(const std::wstring& path) {
 }
 
 // Compute the MD5 of an existing file into res->md5 (no-op if the file is missing).
+// Always hashes the whole file: the stop event is not checked here, because it
+// is already signaled when hashing a user-stopped (partial) image, and a hash
+// cut short would be recorded as if it covered the entire image.
 static void HashFile(CaptureResult* res) {
     HANDLE hf = CreateFileW(res->path.c_str(), GENERIC_READ,
                             FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -558,7 +562,6 @@ static void HashFile(CaptureResult* res) {
     MD5 md5;
     std::vector<BYTE> buf(4 * 1024 * 1024);
     for (;;) {
-        if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) break;
         DWORD rd = 0;
         if (!ReadFile(hf, buf.data(), (DWORD)buf.size(), &rd, nullptr) || rd == 0)
             break;
@@ -602,6 +605,16 @@ static void RunDriverCapture(CaptureResult* res) {
     // CreateProcess takes a mutable command line; build a NUL-terminated copy.
     std::vector<wchar_t> cmdbuf(cmdline.begin(), cmdline.end());
     cmdbuf.push_back(L'\0');
+
+    // Remove any existing file at the target (overwrite was already confirmed).
+    // Otherwise, if the imager fails without writing, the old file's size would
+    // be mistaken for a freshly produced image.
+    if (!DeleteFileW(res->path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        res->errCode = GetLastError();
+        res->error = L"Cannot remove the existing file before capture (error " +
+                     std::to_wstring(res->errCode) + L"):\n" + res->path;
+        return;
+    }
 
     if (!CreateProcessW(imager.c_str(), cmdbuf.data(), nullptr, nullptr, FALSE,
                         0 /*console app gets a hidden console via STARTF_USESHOWWINDOW*/,
@@ -691,14 +704,22 @@ static void RunDriverCapture(CaptureResult* res) {
     res->bytesWritten = produced;
     res->pagesWritten = produced / 4096;
     res->ok = true;
-    res->method = L"WinPmem kernel driver (Velocidex signed driver)";
+    if (exitCode == 0) {
+        res->method = L"WinPmem kernel driver (Velocidex signed driver)";
+    } else {
+        // An image was written but the imager reported an error: keep it, but
+        // flag it (dialog + .meta) as possibly incomplete.
+        res->errCode = (UINT)exitCode;
+        res->method = L"WinPmem kernel driver (Velocidex signed driver) - imager exit code " +
+                      std::to_wstring(exitCode) + L", image may be incomplete";
+    }
 
     // MD5 over the whole image + .meta sidecar (same documentation as driverless).
     HashFile(res);
     WriteMetaSidecar(res, false);
 }
 
-static void* CaptureThreadProc(void* arg) {
+static DWORD WINAPI CaptureThreadProc(LPVOID arg) {
     CaptureResult* res = (CaptureResult*)arg;
     LARGE_INTEGER t0, t1, qf;
     QueryPerformanceCounter(&t0);
@@ -715,7 +736,7 @@ static void* CaptureThreadProc(void* arg) {
     res->seconds = msPerTick > 0 ? ((double)(t1.QuadPart - t0.QuadPart) * msPerTick) / 1000.0
                                  : 0.0;
     PostMessageW(g_hwnd, WM_APP_FINISHED, 0, 0);
-    return nullptr;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -724,7 +745,7 @@ static void* CaptureThreadProc(void* arg) {
 static void DrawRoundRect(HDC dc, RECT r, int rad, HBRUSH fill, HPEN pen) {
     HBRUSH ob = (HBRUSH)SelectObject(dc, fill);
     HPEN op = (HPEN)SelectObject(dc, pen);
-    RoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, rad * 2, rad * 2);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad * 2, rad * 2);
     SelectObject(dc, ob);
     SelectObject(dc, op);
 }
@@ -762,11 +783,14 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
             fill = pressed ? C.dangerDown : (st.hover ? C.dangerHover : C.danger);
         else
             fill = pressed ? RGB(241, 245, 249) : C.secFill;
-        DrawRoundRect(hdc, rc, r, (HBRUSH)CreateSolidBrush(fill), g_penNull);
+        HBRUSH brFill = CreateSolidBrush(fill);
+        DrawRoundRect(hdc, rc, r, brFill, g_penNull);
+        DeleteObject(brFill);
         if (!disabled && st.style == BtnStyle::Secondary) {
             COLORREF bcol = st.hover ? C.accent : C.secBorder;
-            DrawRoundRect(hdc, rc, r, (HBRUSH)GetStockObject(NULL_BRUSH),
-                          CreatePen(PS_SOLID, 1, bcol));
+            HPEN penBorder = CreatePen(PS_SOLID, 1, bcol);
+            DrawRoundRect(hdc, rc, r, (HBRUSH)GetStockObject(NULL_BRUSH), penBorder);
+            DeleteObject(penBorder);
         }
     }
 
@@ -873,6 +897,14 @@ static void ForceClientSize(HWND hwnd, int cw, int ch, bool recenter) {
     SetWindowPos(hwnd, nullptr, newX, newY, newW, newH, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// Close a sub window. The owner (main window) is disabled while a sub window is
+// up; re-enable it *before* destroying the sub window so Windows hands
+// activation back to it instead of to some other application.
+static void CloseSubWindow(HWND hwnd) {
+    if (g_hwnd) EnableWindow(g_hwnd, TRUE);
+    DestroyWindow(hwnd);
+}
+
 static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -927,8 +959,7 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             er.left = q1.x - 1; er.top = q1.y - 1;
             er.right = q2.x + 1; er.bottom = q2.y + 1;
             DrawRoundRect(mem, er, Sc(7, dpi),
-                          (HBRUSH)GetStockObject(NULL_BRUSH),
-                          CreatePen(PS_SOLID, 1, C.secBorder));
+                          (HBRUSH)GetStockObject(NULL_BRUSH), g_penEditBorder);
         }
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, oldb);
@@ -944,13 +975,13 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDC_SUB_PRIMARY:
             g_subResult = 1;
-            DestroyWindow(hwnd);
+            CloseSubWindow(hwnd);
             return 0;
         case IDC_SUB_SECOND:
             g_subResult = 2;
             if (!g_subSpec.openDir.empty())
                 ShellExecuteW(hwnd, L"open", g_subSpec.openDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            DestroyWindow(hwnd);
+            CloseSubWindow(hwnd);
             return 0;
         }
         return 0;
@@ -967,7 +998,7 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CLOSE:
-        DestroyWindow(hwnd);
+        CloseSubWindow(hwnd);
         return 0;
     case WM_DESTROY:
         if (g_subHwnd == hwnd) g_subHwnd = nullptr;
@@ -1016,13 +1047,23 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
     if (!g_subHwnd) return 1;
     ForceClientSize(g_subHwnd, w, h, false);  // same DWM-border correction as main
     if (g_hwnd) CenterOverParent(g_hwnd, g_subHwnd);
+    // Truly modal: block input to the main window so it cannot start a capture
+    // or open a second sub window (which would clobber g_subSpec / g_subHwnd).
+    if (g_hwnd) EnableWindow(g_hwnd, FALSE);
     SetForegroundWindow(g_subHwnd);
-    while (IsWindow(g_subHwnd)) {
+    HWND self = g_subHwnd;
+    while (IsWindow(self)) {
         MSG m;
-        if (!GetMessageW(&m, nullptr, 0, 0)) break; // main window quit
+        if (!GetMessageW(&m, nullptr, 0, 0)) {
+            // Main window quit: WM_QUIT was consumed here, so re-post it for the
+            // main message loop, otherwise the process hangs with no window.
+            PostQuitMessage((int)m.wParam);
+            break;
+        }
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    if (g_hwnd && IsWindow(g_hwnd)) EnableWindow(g_hwnd, TRUE); // safety net
     g_subHwnd = nullptr;
     return g_subResult;
 }
@@ -1273,8 +1314,7 @@ static void OnCapture() {
     s_res.path = path;
     g_activeResult = &s_res;
 
-    HANDLE th = CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)CaptureThreadProc,
-                             &s_res, 0, nullptr);
+    HANDLE th = CreateThread(nullptr, 0, CaptureThreadProc, &s_res, 0, nullptr);
     if (!th) {
         g_capturing = false;
         SetBusy(false);
@@ -1451,11 +1491,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
 
-        // "Use WinPmem driver" checkbox (next to the Capture button, default off).
+        // "Use WinPmem driver" checkbox - in the button row, to the right of
+        // the Close/Stop button (which ends at x=314), so it never overlaps.
+        // Vertically centered on the 38px-tall buttons (y=352..390).
         g_chkDriver = CreateWindowExW(0, L"BUTTON",
                                       L"Use WinPmem driver (24H2/25H2)",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                      Sc(272, dpi), Sc(360, dpi), Sc(268, dpi), Sc(24, dpi),
+                                      Sc(320, dpi), Sc(359, dpi), Sc(268, dpi), Sc(24, dpi),
                                       hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
         SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkDriver, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -1654,6 +1696,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = g_brBg;
+    // Top-left title-bar icon (large for Alt-Tab, small for the caption).
+    // The icon is compiled into the exe (RAMstain.ico, id IDI_RAMSTAIN=101), so
+    // it can be loaded here at class-registration time.
+    wc.hIcon   = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, 32, 32, 0);
+    wc.hIconSm = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, 16, 16, 0);
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc)) return 1;
 
