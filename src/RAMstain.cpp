@@ -29,6 +29,7 @@
 #include <shellapi.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <process.h>
 #include <string>
 #include <vector>
 #include <map>
@@ -57,6 +58,7 @@
 #define IDC_BTN_TERMS    1007
 #define IDC_PROGRESS     1008
 #define IDC_CHK_TOP      1009
+#define IDC_CHK_DRIVER   1010
 
 #define IDC_SUB_TEXT     2001
 #define IDC_SUB_PRIMARY  2002
@@ -108,11 +110,15 @@ static HICON  g_hIcon = nullptr;
 
 static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
-              g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop;
+              g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver;
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
 static bool   g_selftest  = false;
 static bool   g_topmost   = false;   // "Always on top" (default off)
+static bool   g_driverMode = false;  // "Use WinPmem driver" (default off)
+static bool   g_driverWarned = false;// show the driver warning once per session
+static std::wstring g_driverPath;    // explicit imager path from --driver <path>
+static bool   g_cliDriver = false;   // --driver was passed on the command line
 static std::wstring g_cliPath;
 
 static std::wstring g_status;        // status line text
@@ -133,6 +139,7 @@ struct CaptureResult {
     std::string  md5;
     std::wstring path;
     std::wstring metaPath;
+    std::wstring method;             // "Win32 Physical Memory Handle API" or "WinPmem kernel driver"
 };
 static CaptureResult* g_activeResult = nullptr;
 
@@ -304,6 +311,47 @@ static void FillSynthetic(BYTE* buf, size_t n, UINT64 off) {
         buf[i] = (BYTE)((off + i) ^ ((off + i) >> 8) ^ ((off + i) >> 16));
 }
 
+// Write the .meta sidecar for a completed capture. Used by both the driverless
+// and WinPmem-driver paths so every RAMstain image gets the same documentation.
+static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
+    if (!res->ok) return;
+    std::wstring hostName  = GetComputerName();
+    std::wstring osVersion = GetOsVersionString();
+    std::wstring kernelVer = GetKernelVersionString();
+    std::wstring capTime   = MakeTimestamp();
+
+    std::wstring metaPath = res->path;
+    StripExtensionInPlace(metaPath);
+    metaPath += L".meta";
+    std::wstring meta =
+        L"RAMstain capture metadata\n"
+        L"=========================\n"
+        L"Image:       " + res->path + L"\n" +
+        L"Host:        " + hostName + L"\n" +
+        L"OS:          " + osVersion + L"\n" +
+        L"Kernel:      " + kernelVer + L"\n" +
+        L"Captured:    " + capTime + L" (local time)\n" +
+        L"Size:        " + std::to_wstring(res->bytesWritten) + L" bytes\n" +
+        L"Pages:       " + std::to_wstring(res->pagesWritten) + L" x 4096 bytes\n" +
+        L"MD5:         " + Utf8ToWide(res->md5) + L"\n" +
+        L"Tool:        RAMstain " + kVersionStr + L"\n" +
+        L"Method:      " + (selftest
+            ? std::wstring(L"SELF-TEST synthetic source (not a memory capture)\n")
+            : (res->method.empty()
+                ? std::wstring(L"Win32 Physical Memory Handle API (no driver, no network)\n")
+                : (res->method + L"\n"))) +
+        (res->cancelled ? L"Note:        Capture stopped by user (partial image)\n" : L"");
+    std::string metaUtf8 = WideToUtf8(meta);
+    HANDLE hm = CreateFileW(metaPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hm != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        if (WriteFile(hm, metaUtf8.data(), (DWORD)metaUtf8.size(), &wr, nullptr))
+            res->metaPath = metaPath;
+        CloseHandle(hm);
+    }
+}
+
 static void RunCapture(CaptureResult* res, bool selftest) {
     const size_t kPageSize = 4096;
     const size_t kChunkBytes = 2 * 1024 * 1024; // 2 MiB read buffer
@@ -380,11 +428,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
         return;
     }
 
-    // Metadata gathered up front for the .meta sidecar.
-    std::wstring hostName  = GetComputerName();
-    std::wstring osVersion = GetOsVersionString();
-    std::wstring kernelVer = GetKernelVersionString();
-    std::wstring capTime   = MakeTimestamp();
+    // Metadata is written via the shared sidecar writer (WriteMetaSidecar).
 
     MD5 md5;
     std::vector<BYTE> buf(kChunkBytes);
@@ -446,36 +490,212 @@ static void RunCapture(CaptureResult* res, bool selftest) {
     res->ok = res->bytesWritten > 0;
     res->md5 = md5Hex;
 
-    // Write .meta sidecar next to the image.
-    if (res->ok) {
-        std::wstring metaPath = res->path;
-        StripExtensionInPlace(metaPath);
-        metaPath += L".meta";
-        std::wstring meta =
-            L"RAMstain capture metadata\n"
-            L"=========================\n"
-            L"Image:       " + res->path + L"\n" +
-            L"Host:        " + hostName + L"\n" +
-            L"OS:          " + osVersion + L"\n" +
-            L"Kernel:      " + kernelVer + L"\n" +
-            L"Captured:    " + capTime + L" (local time)\n" +
-            L"Size:        " + std::to_wstring(res->bytesWritten) + L" bytes\n" +
-            L"Pages:       " + std::to_wstring(res->pagesWritten) + L" x 4096 bytes\n" +
-            L"MD5:         " + Utf8ToWide(md5Hex) + L"\n" +
-            L"Tool:        RAMstain " + kVersionStr + L"\n" +
-            (selftest ? L"Method:      SELF-TEST synthetic source (not a memory capture)\n"
-                      : L"Method:      Win32 Physical Memory Handle API (no driver, no network)\n") +
-            (res->cancelled ? L"Note:        Capture stopped by user (partial image)\n" : L"");
-        std::string metaUtf8 = WideToUtf8(meta);
-        HANDLE hm = CreateFileW(metaPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hm != INVALID_HANDLE_VALUE) {
-            DWORD wr = 0;
-            if (WriteFile(hm, metaUtf8.data(), (DWORD)metaUtf8.size(), &wr, nullptr))
-                res->metaPath = metaPath;
-            CloseHandle(hm);
+    // Write .meta sidecar next to the image (shared with the driver path).
+    WriteMetaSidecar(res, selftest);
+}
+
+// ---------------------------------------------------------------------------
+//  Optional WinPmem driver fallback (for hardened OS builds where the driverless
+//  handle API is blocked, e.g. Windows 11 24H2/25H2).
+//
+//  Shells out to the official signed Velocidex WinPmem Go imager, which embeds
+//  its own signed kernel driver: it installs/starts the service, writes the
+//  .raw image, then uninstalls itself. We compute the MD5 over the resulting
+//  file and write the same .meta sidecar as the driverless path.
+// ---------------------------------------------------------------------------
+// Locate the WinPmem Go imager (signed). Search order:
+//   1. g_driverPath (from --driver <path>)
+//   2. go-winpmem-signed.exe / go-winpmem.exe next to RAMstain.exe
+//   3. %RAMSTAIN_WINPMEM% environment variable (a path to the exe)
+//   4. C:\RAMstain\go-winpmem-signed.exe
+static std::wstring FindWinPmemImager() {
+    if (!g_driverPath.empty()) {
+        if (GetFileAttributesW(g_driverPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return g_driverPath;
+        return L""; // explicit path given but missing
+    }
+    std::wstring exeDir = GetExeDir();
+    std::vector<std::wstring> candidates = {
+        exeDir + L"\\go-winpmem-signed.exe",
+        exeDir + L"\\go-winpmem.exe",
+        exeDir + L"\\winpmem-go.exe",
+    };
+    for (const auto& c : candidates)
+        if (GetFileAttributesW(c.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return c;
+    wchar_t env[MAX_PATH];
+    if (GetEnvironmentVariableW(L"RAMSTAIN_WINPMEM", env, MAX_PATH) > 0 &&
+        GetFileAttributesW(env) != INVALID_FILE_ATTRIBUTES)
+        return env;
+    std::wstring c4 = L"C:\\RAMstain\\go-winpmem-signed.exe";
+    if (GetFileAttributesW(c4.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return c4;
+    return L"";
+}
+
+static DWORD WaitForAnyStop(DWORD, DWORD ms) {
+    if (g_stopEvent)
+        return WaitForSingleObject(g_stopEvent, ms);
+    return WAIT_TIMEOUT;
+}
+
+// Open a file read-only and return its size (0 if it does not exist).
+static UINT64 GetFileBytes(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER sz = {0};
+    BOOL ok = GetFileSizeEx(h, &sz);
+    CloseHandle(h);
+    return ok ? (UINT64)sz.QuadPart : 0;
+}
+
+// Compute the MD5 of an existing file into res->md5 (no-op if the file is missing).
+static void HashFile(CaptureResult* res) {
+    HANDLE hf = CreateFileW(res->path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    MD5 md5;
+    std::vector<BYTE> buf(4 * 1024 * 1024);
+    for (;;) {
+        if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) break;
+        DWORD rd = 0;
+        if (!ReadFile(hf, buf.data(), (DWORD)buf.size(), &rd, nullptr) || rd == 0)
+            break;
+        md5.Update(buf.data(), rd);
+    }
+    res->md5 = md5.Hex();
+    CloseHandle(hf);
+}
+
+// Run the WinPmem imager to produce res->path, then hash + write meta.
+static void RunDriverCapture(CaptureResult* res) {
+    std::wstring imager = FindWinPmemImager();
+    if (imager.empty()) {
+        res->errCode = 0;
+        res->error =
+            L"WinPmem imager not found.\n\n"
+            L"Driver mode uses the official signed Velocidex WinPmem Go imager.\n"
+            L"Place 'go-winpmem-signed.exe' next to RAMstain.exe, or:\n"
+            L"  * pass it on the command line:  RAMstain.exe --driver C:\\path\\go-winpmem-signed.exe\n"
+            L"  * or set the environment variable RAMSTAIN_WINPMEM to its full path.\n\n"
+            L"Download: https://github.com/Velocidex/WinPmem/releases\n"
+            L"(use the go-winpmem ... signed ... exe)";
+        return;
+    }
+
+    // Download-free, local: the imager writes res->path itself, then uninstalls.
+    size_t sl = imager.find_last_of(L"\\/");
+    std::wstring imagerDir = (sl == std::wstring::npos) ? L"." : imager.substr(0, sl);
+
+    // Build command line:  "<imager>" acquire "<res->path>"
+    std::wstring cmdline = L"\"" + imager + L"\" acquire \"" + res->path + L"\"";
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    // CreateProcess takes a mutable command line; build a NUL-terminated copy.
+    std::vector<wchar_t> cmdbuf(cmdline.begin(), cmdline.end());
+    cmdbuf.push_back(L'\0');
+
+    if (!CreateProcessW(imager.c_str(), cmdbuf.data(), nullptr, nullptr, FALSE,
+                        0 /*console app gets a hidden console via STARTF_USESHOWWINDOW*/,
+                        nullptr, imagerDir.c_str(), &si, &pi)) {
+        res->errCode = GetLastError();
+        res->error = L"Failed to start WinPmem imager (error " +
+                     std::to_wstring(res->errCode) + L").\n\nImager: " + imager;
+        return;
+    }
+
+    PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)0, 0);
+
+    // Monitor the imager. WinPmem writes progress to a console we hid; instead we
+    // watch the output file grow and surface percentage while it's being written.
+    UINT64 lastBytes = 0;
+    while (true) {
+        DWORD stopWait = WaitForAnyStop(WAIT_TIMEOUT, 250);
+        if (stopWait == WAIT_OBJECT_0) { // user pressed Stop
+            res->cancelled = true;
+            TerminateProcess(pi.hProcess, 0);
+            break;
+        }
+        DWORD w = WaitForSingleObject(pi.hProcess, 0);
+        if (w == WAIT_OBJECT_0)
+            break; // imager finished (success or error)
+        // reflect growth as progress
+        UINT64 fsz = GetFileBytes(res->path);
+        if (fsz > 0) {
+            res->bytesWritten = fsz;
+            res->pagesWritten = fsz / 4096;
+            UINT64 needed = (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0);
+            int pct = needed ? (int)((double)fsz / (double)needed * 100.0) : 0;
+            if (pct > 100) pct = 100;
+            if (fsz != lastBytes) {
+                lastBytes = fsz;
+                PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0);
+            }
         }
     }
+
+    DWORD exitCode = STILL_ACTIVE;
+    WaitForSingleObject(pi.hProcess, 5000);
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    // WinPmem always uninstalls its service when it exits; belt-and-suspenders.
+    {
+        std::wstring uninstCmd = L"\"" + imager + L"\" uninstall";
+        std::vector<wchar_t> ub(uninstCmd.begin(), uninstCmd.end()); ub.push_back(L'\0');
+        STARTUPINFOW si2; ZeroMemory(&si2, sizeof(si2)); si2.cb = sizeof(si2);
+        si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi2; ZeroMemory(&pi2, sizeof(pi2));
+        if (CreateProcessW(imager.c_str(), ub.data(), nullptr, nullptr, FALSE,
+                           0, nullptr, imagerDir.c_str(), &si2, &pi2)) {
+            WaitForSingleObject(pi2.hProcess, 8000);
+            CloseHandle(pi2.hProcess);
+            CloseHandle(pi2.hThread);
+        }
+    }
+
+    if (res->cancelled) {
+        res->bytesWritten = GetFileBytes(res->path);
+        res->pagesWritten = res->bytesWritten / 4096;
+        res->ok = (res->bytesWritten > 0);
+        res->method = L"WinPmem kernel driver (Velocidex) - stopped by user";
+        if (res->ok) {
+            HashFile(res);                 // MD5 over the partial image
+            WriteMetaSidecar(res, false);  // sidecar notes the user stop
+        }
+        return;
+    }
+
+    // Confirm an image was produced.
+    UINT64 produced = GetFileBytes(res->path);
+    if (produced == 0) {
+        res->errCode = (exitCode == 0) ? 0 : (UINT)exitCode;
+        res->error =
+            L"WinPmem imager finished without producing an image (exit code " +
+            std::to_wstring(exitCode) + L").\n\n"
+            L"Imager: " + imager + L"\n\n"
+            L"Common causes: not running as Administrator, or the OS blocked the "
+            L"signed driver. Check Windows Event Viewer for a driver-load failure.";
+        return;
+    }
+
+    res->bytesWritten = produced;
+    res->pagesWritten = produced / 4096;
+    res->ok = true;
+    res->method = L"WinPmem kernel driver (Velocidex signed driver)";
+
+    // MD5 over the whole image + .meta sidecar (same documentation as driverless).
+    HashFile(res);
+    WriteMetaSidecar(res, false);
 }
 
 static void* CaptureThreadProc(void* arg) {
@@ -486,7 +706,10 @@ static void* CaptureThreadProc(void* arg) {
     if (QueryPerformanceFrequency(&qf) && qf.QuadPart > 0)
         msPerTick = 1000.0 / (double)qf.QuadPart;
 
-    RunCapture(res, g_selftest);
+    if (g_driverMode && !g_selftest)
+        RunDriverCapture(res);          // optional WinPmem signed-driver path
+    else
+        RunCapture(res, g_selftest);    // default driverless path (or synthetic self-test)
 
     QueryPerformanceCounter(&t1);
     res->seconds = msPerTick > 0 ? ((double)(t1.QuadPart - t0.QuadPart) * msPerTick) / 1000.0
@@ -754,11 +977,35 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// Win32 multiline edit controls treat CRLF (0x0D 0x0A) as the line break;
+// a bare LF (0x0A) renders the whole text as one long line. Our body strings
+// (legal docs, driver warnings, completion messages) use plain "\n", so
+// normalize to CRLF before any dialog displays them.
+static void NormalizeNewlines(std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size() + 128);
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'\r' && i + 1 < s.size() && s[i + 1] == L'\n') {
+            out += L"\r\n";
+            ++i;
+        } else if (s[i] == L'\n') {
+            out += L"\r\n";
+        } else if (s[i] == L'\r') {
+            out += L"\r\n";
+        } else {
+            out += s[i];
+        }
+    }
+    s = std::move(out);
+}
+
 // Show a themed modal sub window (blocks until closed).
 // Returns 1 if the primary button was pressed, 2 if the secondary.
-static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& body,
+static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bodyIn,
                          const std::wstring& primaryBtn, const std::wstring& secondBtn,
                          const std::wstring& openDir, int w, int h) {
+    std::wstring body = bodyIn;
+    NormalizeNewlines(body);
     g_subSpec = SubSpec{kind, std::wstring(title), body, primaryBtn, secondBtn, openDir, w, h};
     g_subResult = 1;
     HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -949,6 +1196,32 @@ static void OnCapture() {
         SetTextW(g_editPath, path);
     }
 
+    // Driver mode (optional): checkbox OR --driver on the command line.
+    bool cliChecked = g_cliDriver;
+    if (cliChecked)
+        SendMessageW(g_chkDriver, BM_SETCHECK, BST_CHECKED, 0);
+    g_driverMode = (!g_selftest &&
+                    (SendMessageW(g_chkDriver, BM_GETCHECK, 0, 0) == BST_CHECKED));
+    if (g_driverMode && FindWinPmemImager().empty()) {
+        // No imager available. Let the user either fall back to driverless or cancel.
+        int r = ShowSubWindow(0, L"WinPmem imager not found",
+            L"The 'Use WinPmem driver' option is enabled, but no WinPmem Go imager "
+            L"was found.\n\n"
+            L"Place 'go-winpmem-signed.exe' next to RAMstain.exe, or:\n"
+            L"  • pass it:  RAMstain.exe --driver C:\\path\\go-winpmem-signed.exe\n"
+            L"  • set the RAMSTAIN_WINPMEM environment variable to its full path.\n\n"
+            L"Download: https://github.com/Velocidex/WinPmem/releases\n\n"
+            L"You can capture now without the driver, but on Windows 11 24H2/25H2 "
+            L"the driverless method is usually blocked by the OS.",
+            L"OK", L"Capture without driver", L"", 520, 360);
+        if (r == 2) {
+            g_driverMode = false;               // proceed driverless
+            SendMessageW(g_chkDriver, BM_SETCHECK, BST_UNCHECKED, 0);
+        } else {
+            return;                              // cancel
+        }
+    }
+
     // Confirm overwrite.
     if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
         std::wstring q = L"\"" + path + L"\" already exists.\n\nOverwrite the existing file?";
@@ -970,13 +1243,30 @@ static void OnCapture() {
         return;
     }
 
+    // One warning before we load a kernel driver (once per session).
+    if (g_driverMode && !g_driverWarned) {
+        int r = ShowSubWindow(0, L"Driver mode",
+            L"Driver mode will:\n"
+            L"  • temporarily load the signed WinPmem kernel driver\n"
+            L"  • create and remove a 'winpmem' Windows service\n"
+            L"  • capture the full physical memory to your chosen path\n\n"
+            L"RAMstain is already running as Administrator.\n\nContinue?",
+            L"Capture with driver", L"Cancel", L"", 500, 300);
+        g_driverWarned = true;
+        if (r != 1) { g_driverMode = false; return; }
+    }
+
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_capturing = true;
     SetBusy(true);
     SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
     SendMessageW(g_progress, PBM_SETPOS, 0, 0);
-    UpdateStatus(g_selftest ? L"Running self-test (synthetic source)..."
-                            : L"Capturing physical memory...", C.accent);
+    if (g_selftest)
+        UpdateStatus(L"Running self-test (synthetic source)...", C.accent);
+    else if (g_driverMode)
+        UpdateStatus(L"Capturing via WinPmem driver...", C.accent);
+    else
+        UpdateStatus(L"Capturing physical memory...", C.accent);
 
     static CaptureResult s_res;
     s_res = CaptureResult();
@@ -1030,6 +1320,8 @@ static void OnCaptureFinished() {
         msg += L"Time:   " + FormatDuration(r->seconds) + L"\n";
         msg += L"Speed:  " + std::to_wstring((int)mbps) + L" MB/s\n";
         msg += L"MD5:    " + Utf8ToWide(r->md5) + L"\n";
+        if (!r->method.empty())
+            msg += L"Method: " + r->method + L"\n";
         if (!r->metaPath.empty())
             msg += L"\nMetadata sidecar:\n" + r->metaPath + L"\n";
         msg += L"\nStored locally. No data was transmitted anywhere.";
@@ -1159,6 +1451,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
 
+        // "Use WinPmem driver" checkbox (next to the Capture button, default off).
+        g_chkDriver = CreateWindowExW(0, L"BUTTON",
+                                      L"Use WinPmem driver (24H2/25H2)",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                      Sc(272, dpi), Sc(360, dpi), Sc(268, dpi), Sc(24, dpi),
+                                      hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
+        SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkDriver, BM_SETCHECK, BST_UNCHECKED, 0);
+
         g_status = L"Ready.";
         g_statusColor = C.muted;
         return 0;
@@ -1202,6 +1503,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             return 0;
         }
+        case IDC_CHK_DRIVER:
+            // Just reflect the checkbox into g_driverMode; OnCapture is the only
+            // consumer and it re-reads this each time.
+            return 0;
         case IDOK:
         case IDCANCEL:        OnCloseButton(); return 0;
         }
@@ -1293,11 +1598,12 @@ static void DestroyThemeGfx() {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // CLI: RAMstain.exe [--selftest] ["path"]
+    // CLI: RAMstain.exe [--selftest] [--driver [path]] [--driver-mode] [--no-driver] ["out.raw"]
     {
         std::wstring cmd = GetCommandLineW();
         size_t i = 0;
         bool firstToken = true;
+        std::vector<std::wstring> toks;
         while (i < cmd.size()) {
             while (i < cmd.size() && (cmd[i] == L' ' || cmd[i] == L'\t')) ++i;
             if (i >= cmd.size()) break;
@@ -1310,8 +1616,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 while (i < cmd.size() && cmd[i] != L' ' && cmd[i] != L'\t') { tok.push_back(cmd[i]); ++i; }
             }
             if (firstToken) { firstToken = false; continue; } // program name
-            if (_wcsicmp(tok.c_str(), L"--selftest") == 0) g_selftest = true;
-            else if (g_cliPath.empty()) { g_cliPath = tok; TrimRight(g_cliPath); }
+            toks.push_back(tok);
+        }
+        for (size_t k = 0; k < toks.size(); ++k) {
+            const std::wstring& t = toks[k];
+            if (_wcsicmp(t.c_str(), L"--selftest") == 0) {
+                g_selftest = true;
+            } else if (_wcsicmp(t.c_str(), L"--driver-mode") == 0 ||
+                       _wcsicmp(t.c_str(), L"--driver") == 0) {
+                g_cliDriver = true;                       // enable driver mode
+                if (_wcsicmp(t.c_str(), L"--driver") == 0 &&
+                    k + 1 < toks.size() && toks[k + 1][0] != L'-') {
+                    g_driverPath = toks[k + 1];            // optional explicit imager path
+                    ++k;
+                }
+            } else if (_wcsicmp(t.c_str(), L"--no-driver") == 0) {
+                g_cliDriver = false;                       // explicitly disable
+            } else if (g_cliPath.empty()) {
+                g_cliPath = t;
+                TrimRight(g_cliPath);
+            }
         }
     }
 
