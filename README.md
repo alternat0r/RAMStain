@@ -91,7 +91,16 @@ RAMstain.exe --swapfile                   also collect swapfile.sys
 RAMstain.exe --system-files               also collect pagefile, hibernation file and swapfile
 RAMstain.exe --no-memory --system-files   system files only, no memory image
 RAMstain.exe --selftest "C:\out\test.raw" 512 MB synthetic test, no real memory read
+RAMstain.exe --help                       list the options (also -h, /?)
 ```
+
+Options only preselect the window's settings; the capture starts when you
+click **Capture**. An unknown option shows the help instead of starting.
+
+`--help` prints to the console when it can: redirected output
+(`RAMstain.exe --help > help.txt`, or piped) or an elevated prompt. From a
+normal prompt, Windows starts RAMstain elevated in a new process with no
+console, so the help appears in a message box instead.
 
 An external imager can also be set with the `RAMSTAIN_WINPMEM` environment
 variable. Both the classic WinPmem 2.x and the Go imager (`go-winpmem`) work.

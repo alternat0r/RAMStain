@@ -29,6 +29,7 @@
 //    RAMstain.exe --system-files              collect pagefile, hibernation file and swapfile
 //    RAMstain.exe --no-memory                 no memory image (system files only)
 //    RAMstain.exe --selftest ["C:\path\out"]  synthetic 512 MiB pipeline test
+//    RAMstain.exe --help                      list the options (also -h, /?)
 //
 //  Build: MSVC (Visual Studio 2022), x64, static CRT
 // ============================================================================
@@ -3940,10 +3941,86 @@ static void DestroyThemeGfx() {
     if (g_fHdrAnim) DeleteObject(g_fHdrAnim);
 }
 
+// --help: the supported command line, from one table. Printed to the console
+// when there is one to reach (output redirected to a file or pipe, or started
+// from an elevated prompt, whose console an elevated GUI app can attach to);
+// otherwise - e.g. a normal prompt, where Windows starts RAMstain elevated in
+// a new process with no console - shown in a message box. `problem` (an
+// unknown option) is printed first. Returns the process exit code.
+static int ShowCommandLineHelp(const std::wstring& problem) {
+    struct { const wchar_t* opt; const wchar_t* desc; } kOpts[] = {
+        { L"\"<output.raw>\"",         L"Pre-fill the save path (a folder gets a timestamped file name)" },
+        { L"--split <MB>",             L"Preselect the split part size in MB (0 = no split, 4095 = FAT32-safe 4 GB)" },
+        { L"--driver [<imager.exe>]",  L"Use the WinPmem driver (the default); optionally an external imager" },
+        { L"--no-driver",              L"Select the experimental driverless method" },
+        { L"--pagefile",               L"Also collect pagefile.sys" },
+        { L"--hiberfil",               L"Also collect hiberfil.sys" },
+        { L"--swapfile",               L"Also collect swapfile.sys" },
+        { L"--system-files",           L"Also collect pagefile.sys, hiberfil.sys and swapfile.sys" },
+        { L"--no-memory",              L"No memory image: collect the selected system files only" },
+        { L"--selftest [\"<out.raw>\"]", L"512 MB synthetic test capture (no real memory is read)" },
+        { L"--help, -h, /?",           L"Show this help" },
+    };
+    std::wstring head = std::wstring(L"RAMstain ") + kVersionStr +
+                        L" - offline physical memory capture for Windows\n\n";
+    if (!problem.empty()) head = problem + L"\n\n" + head;
+    const wchar_t* usage = L"Usage:  RAMstain.exe [\"<output.raw>\"] [options]\n\n";
+    // Notes: hard-wrapped for an 80-column console; the message box wraps itself.
+    const wchar_t* notes =
+        L"Options only preselect the window's settings; the capture starts when you\n"
+        L"click Capture. An external imager can also be set with the RAMSTAIN_WINPMEM\n"
+        L"environment variable. RAMstain runs as Administrator.\n";
+    const wchar_t* notesBox =
+        L"Options only preselect the window's settings; the capture starts when you "
+        L"click Capture.\n\nAn external imager can also be set with the RAMSTAIN_WINPMEM "
+        L"environment variable. RAMstain runs as Administrator.";
+
+    // Console form: aligned columns.
+    std::wstring con = L"\n" + head + usage + L"Options:\n";
+    for (const auto& o : kOpts) {
+        std::wstring opt = o.opt;
+        con += L"  " + opt + std::wstring(opt.size() < 26 ? 26 - opt.size() : 1, L' ') + o.desc + L"\n";
+    }
+    con += L"\n" + std::wstring(notes);
+
+    // 1. stdout redirected to a file or pipe (inherited by a GUI process too).
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD type = (out && out != INVALID_HANDLE_VALUE) ? GetFileType(out) : FILE_TYPE_UNKNOWN;
+    if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) {
+        std::string u8 = WideToUtf8(con);
+        DWORD wr = 0;
+        WriteFile(out, u8.data(), (DWORD)u8.size(), &wr, nullptr);
+        return problem.empty() ? 0 : 2;
+    }
+    // 2. The console of the prompt that started us, if we can attach to it.
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        HANDLE hc = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+        if (hc != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteConsoleW(hc, con.c_str(), (DWORD)con.size(), &wr, nullptr);
+            CloseHandle(hc);
+            FreeConsole();
+            return problem.empty() ? 0 : 2;
+        }
+        FreeConsole();
+    }
+    // 3. Message box: proportional font, so each option gets its own line.
+    std::wstring box = head + usage;
+    for (const auto& o : kOpts)
+        box += std::wstring(o.opt) + L"\n        " + o.desc + L"\n";
+    box += L"\n" + std::wstring(notesBox);
+    MessageBoxW(nullptr, box.c_str(), L"RAMstain - command line",
+                MB_OK | (problem.empty() ? MB_ICONINFORMATION : MB_ICONWARNING));
+    return problem.empty() ? 0 : 2;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // CLI: RAMstain.exe [--selftest] [--driver [path]] [--driver-mode] [--no-driver] ["out.raw"]
+    // CLI: see ShowCommandLineHelp (RAMstain.exe --help) for the options.
+    bool showHelp = false;
+    std::wstring badOption;
     {
         std::wstring cmd = GetCommandLineW();
         size_t i = 0;
@@ -3965,7 +4042,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         }
         for (size_t k = 0; k < toks.size(); ++k) {
             const std::wstring& t = toks[k];
-            if (_wcsicmp(t.c_str(), L"--selftest") == 0) {
+            if (_wcsicmp(t.c_str(), L"--help") == 0 || _wcsicmp(t.c_str(), L"-h") == 0 ||
+                t == L"/?" || t == L"-?") {
+                showHelp = true;
+            } else if (_wcsicmp(t.c_str(), L"--selftest") == 0) {
                 g_selftest = true;
             } else if (_wcsicmp(t.c_str(), L"--driver-mode") == 0 ||
                        _wcsicmp(t.c_str(), L"--driver") == 0) {
@@ -3995,12 +4075,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 const std::wstring& v = toks[++k];
                 if (!v.empty() && wcsspn(v.c_str(), L"0123456789") == v.size() && v.size() <= 7)
                     g_cliSplitMB = (UINT)wcstoul(v.c_str(), nullptr, 10);
+            } else if (t.size() > 1 && t[0] == L'-' && badOption.empty()) {
+                badOption = t;                             // unknown option: not a save path
             } else if (g_cliPath.empty()) {
                 g_cliPath = t;
                 TrimRight(g_cliPath);
             }
         }
     }
+    // Before the single-instance check, so --help works while RAMstain is open.
+    if (showHelp || !badOption.empty())
+        return ShowCommandLineHelp(badOption.empty() ? std::wstring()
+                                                     : L"Unknown option: " + badOption);
 
     // Single instance, machine-wide ("Global\" covers other logon sessions too):
     // two captures loading the WinPmem driver at once would conflict. The
