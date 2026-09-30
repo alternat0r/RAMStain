@@ -24,7 +24,9 @@
 //    RAMstain.exe --no-driver                 start with the driverless path selected
 //    RAMstain.exe --pagefile                  also collect pagefile.sys
 //    RAMstain.exe --hiberfil                  also collect hiberfil.sys
-//    RAMstain.exe --system-files              collect both pagefile and hibernation file
+//    RAMstain.exe --swapfile                  also collect swapfile.sys
+//    RAMstain.exe --system-files              collect pagefile, hibernation file and swapfile
+//    RAMstain.exe --no-memory                 no memory image (system files only)
 //    RAMstain.exe --selftest ["C:\path\out"]  synthetic 512 MiB pipeline test
 //
 //  Build: MSVC (Visual Studio 2022), x64, static CRT
@@ -79,6 +81,8 @@
 #define IDC_BTN_SPLITHELP 1012
 #define IDC_CHK_PAGEFILE 1013
 #define IDC_CHK_HIBERFIL 1014
+#define IDC_CHK_MEMORY   1015
+#define IDC_CHK_SWAPFILE 1016
 
 #define IDC_SUB_TEXT     2001
 #define IDC_SUB_PRIMARY  2002
@@ -157,7 +161,7 @@ static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
               g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit,
               g_btnSplitHelp, g_lblSave, g_lblSplit, g_lblCollect,
-              g_chkPagefile, g_chkHiberfil;
+              g_chkMemory, g_chkPagefile, g_chkHiberfil, g_chkSwapfile;
 static HWND   g_lastFocus = nullptr;    // control to refocus when the window is reactivated
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
@@ -176,8 +180,14 @@ static UINT   g_cliSplitMB = 0;      // --split <MB> from the command line (0 = 
 // OnCapture; g_cliCollect* is the command-line preselect for the checkboxes).
 static bool   g_collectPagefile = false;
 static bool   g_collectHiberfil = false;
+static bool   g_collectSwapfile = false;
 static bool   g_cliCollectPagefile = false;
 static bool   g_cliCollectHiberfil = false;
+static bool   g_cliCollectSwapfile = false;
+// Memory image for this run (off = system files only); g_cliNoMemory is the
+// --no-memory preselect for its checkbox.
+static bool   g_captureMemory = true;
+static bool   g_cliNoMemory = false;
 
 static std::wstring g_status;        // status line text
 static COLORREF     g_statusColor;   // status line color
@@ -195,10 +205,22 @@ struct SplitPart {
     std::string  sha256;             // empty when no hashes were computed
 };
 
-// One system file collected alongside the memory image (pagefile.sys or
-// hiberfil.sys), copied in full with a single hash pass.
+// The system files RAMstain can collect, in collection order. Each is
+// <volume>\<name>.sys, copied to <image base>__<name>.raw (see SysName).
+enum class SysKind { Pagefile, Hiberfil, Swapfile };
+static const SysKind kSysKinds[] = { SysKind::Pagefile, SysKind::Hiberfil, SysKind::Swapfile };
+
+static const wchar_t* SysName(SysKind k) {
+    return k == SysKind::Pagefile ? L"pagefile" : k == SysKind::Hiberfil ? L"hiberfil" : L"swapfile";
+}
+static const wchar_t* SysLabel(SysKind k) {
+    return k == SysKind::Pagefile ? L"Pagefile" : k == SysKind::Hiberfil ? L"Hibernation file" : L"Swapfile";
+}
+
+// One system file collected alongside the memory image (pagefile.sys,
+// hiberfil.sys or swapfile.sys), copied in full with a single hash pass.
 struct SysFileCapture {
-    std::wstring kind;               // "pagefile" or "hiberfil"
+    SysKind      kind = SysKind::Pagefile;
     std::wstring source;             // location found on this system (empty if not present)
     std::wstring path;               // the collected copy (empty if not collected)
     UINT64       bytes = 0;
@@ -1260,6 +1282,21 @@ static std::wstring GetHiberfilPath() {
     return sv.empty() ? std::wstring() : sv + L"hiberfil.sys";
 }
 
+// Candidate locations of a system file (the first that exists is collected).
+// swapfile.sys (the swap file for Store/UWP apps) sits next to the pagefile
+// on the system volume.
+static std::vector<std::wstring> SysFileSources(SysKind k) {
+    if (k == SysKind::Pagefile) return GetPagefilePaths();
+    std::wstring sv = GetSystemVolume();
+    if (sv.empty()) return {};
+    return { k == SysKind::Hiberfil ? GetHiberfilPath() : sv + L"swapfile.sys" };
+}
+
+static bool& SysWanted(SysKind k) {
+    return k == SysKind::Pagefile ? g_collectPagefile
+         : k == SysKind::Hiberfil ? g_collectHiberfil : g_collectSwapfile;
+}
+
 // Reads the directory entry rather than the file: GetFileAttributesW opens the
 // file, which fails with a sharing violation on pagefile.sys / hiberfil.sys.
 static bool FilePresent(const std::wstring& p) {
@@ -1580,13 +1617,13 @@ private:
 // The .meta sidecar for one requested system file (written on every outcome -
 // success, partial, or "not found" - so the record exists either way).
 // metaPath is passed explicitly; the "Collected:" line is empty->"(not collected)".
-// memComplete / memPartial describe the memory image state at collection time.
+// memNote describes the memory image state at collection time.
 static void WriteSysFileMeta(const SysFileCapture& sf, const std::wstring& metaPath,
-                             bool memComplete, bool memPartial) {
+                             const wchar_t* memNote) {
     if (metaPath.empty()) return;
     std::wstring host = GetComputerName();
     std::wstring os = GetOsVersionString();
-    std::wstring label = (sf.kind == L"pagefile") ? L"pagefile.sys" : L"hiberfil.sys";
+    std::wstring label = std::wstring(SysName(sf.kind)) + L".sys";
     auto ht = [](const std::string& h) { return h.empty() ? std::wstring(L"not computed") : Utf8ToWide(h); };
     std::wstring m;
     m += L"RAMstain system file metadata\n";
@@ -1601,13 +1638,7 @@ static void WriteSysFileMeta(const SysFileCapture& sf, const std::wstring& metaP
     m += L"Size:        ";  m += std::to_wstring(sf.bytes);  m += L" bytes\n";
     m += L"SHA-256:     ";  m += ht(sf.sha256);  m += L"\n";
     if (!sf.method.empty()) { m += L"Method:      "; m += sf.method; m += L"\n"; }
-    m += L"Note:        ";
-    if (memComplete)
-        m += L"Collected alongside the RAMstain memory image.\n";
-    else if (memPartial)
-        m += L"The memory image was stopped by the user (partial); this system file is complete and valid on its own.\n";
-    else
-        m += L"The memory image was not captured; this system file is complete and valid on its own.\n";
+    m += L"Note:        ";  m += memNote;  m += L"\n";
     if (!sf.error.empty()) { m += L"Note:        "; m += sf.error; m += L"\n"; }
     std::string u = WideToUtf8(m);
     HANDLE h = CreateFileW(metaPath.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -1718,42 +1749,42 @@ static bool CopySystemFile(const std::wstring& src, const std::wstring& dst, Sys
     return ok;
 }
 
-// Collect one requested system file (pagefile or hiberfil) into res->sysfiles.
-// A .meta sidecar is written for every outcome so the record always exists.
-static void CollectSystemFile(CaptureResult* res, bool pagefile) {
+// Collect one requested system file into res->sysfiles. A .meta sidecar is
+// written for every outcome so the record always exists.
+static void CollectSystemFile(CaptureResult* res, SysKind kind) {
     SysFileCapture sf;
-    sf.kind = pagefile ? L"pagefile" : L"hiberfil";
+    sf.kind = kind;
     std::wstring base = res->path;
     StripExtensionInPlace(base);
-    std::wstring dst = base + (pagefile ? L"__pagefile.raw" : L"__hiberfil.raw");
+    std::wstring dst = base + L"__" + SysName(kind) + L".raw";
 
     // Memory-image state at collection time, for the sidecar's note.
-    bool memComplete = res->ok && !res->cancelled;          // full image written (hashes optional)
-    bool memPartial  = res->cancelled && res->bytesWritten > 0;  // stopped mid-capture
+    const wchar_t* memNote =
+        !g_captureMemory ? L"Collected on its own (no memory image was requested)."
+        : (res->ok && !res->cancelled) ? L"Collected alongside the RAMstain memory image."
+        : (res->cancelled && res->bytesWritten > 0)
+            ? L"The memory image was stopped by the user (partial); this system file is complete and valid on its own."
+            : L"The memory image was not captured; this system file is complete and valid on its own.";
 
     // Find the source.
-    std::vector<std::wstring> sources;
-    if (pagefile) {
-        sources = GetPagefilePaths();
-    } else {
-        std::wstring p = GetHiberfilPath();
-        if (!p.empty()) sources.push_back(p);
-    }
+    std::vector<std::wstring> sources = SysFileSources(kind);
 
     // Pick the first that exists.
     std::wstring src;
     for (const auto& s : sources) if (FilePresent(s)) { src = s; break; }
 
     if (src.empty()) {
-        sf.error = pagefile
-            ? L"pagefile.sys not found on this system (the pagefile may be disabled). Nothing to collect."
-            : L"hiberfil.sys not found on this system (hibernation may be disabled). Nothing to collect.";
+        sf.error = std::wstring(SysName(kind)) + L".sys not found on this system (" +
+            (kind == SysKind::Pagefile ? L"the pagefile may be disabled"
+             : kind == SysKind::Hiberfil ? L"hibernation may be disabled"
+                                         : L"Windows creates it only when needed") +
+            L"). Nothing to collect.";
         if (!sources.empty()) sf.source = sources[0];
         // Still write a sidecar (next to where the image would go) recording it.
         std::wstring metaPath = dst;
         StripExtensionInPlace(metaPath);
         metaPath += L".meta";
-        WriteSysFileMeta(sf, metaPath, memComplete, memPartial);
+        WriteSysFileMeta(sf, metaPath, memNote);
         sf.metaPath = metaPath;
         res->sysfiles.push_back(sf);
         return;
@@ -1765,19 +1796,19 @@ static void CollectSystemFile(CaptureResult* res, bool pagefile) {
     std::wstring metaPath = dst;
     StripExtensionInPlace(metaPath);
     metaPath += L".meta";
-    WriteSysFileMeta(sf, metaPath, memComplete, memPartial);
+    WriteSysFileMeta(sf, metaPath, memNote);
     if (!sf.path.empty()) sf.metaPath = metaPath;
     res->sysfiles.push_back(sf);
 }
 
-// Collect the requested pagefile / hibernation file(s) alongside the image.
+// Collect the requested system files alongside the image.
 // Runs in the worker thread after the memory capture (or in its place).
 static void CollectSystemFiles(CaptureResult* res) {
-    if (!g_collectPagefile && !g_collectHiberfil) return;
+    if (!g_collectPagefile && !g_collectHiberfil && !g_collectSwapfile) return;
     // Report the phase; total unknown (pagefile size varies), so 0.
     PostPhase(CapturePhase::Collecting, 0);
-    if (g_collectPagefile) CollectSystemFile(res, true);
-    if (g_collectHiberfil) CollectSystemFile(res, false);
+    for (SysKind k : kSysKinds)
+        if (SysWanted(k)) CollectSystemFile(res, k);
     PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)100, 0);
 }
 
@@ -1985,7 +2016,9 @@ static DWORD WINAPI CaptureThreadProc(LPVOID arg) {
     if (QueryPerformanceFrequency(&qf) && qf.QuadPart > 0)
         msPerTick = 1000.0 / (double)qf.QuadPart;
 
-    if (g_driverMode && !g_selftest)
+    if (!g_captureMemory)
+        ;                               // system files only (collected below)
+    else if (g_driverMode && !g_selftest)
         RunDriverCapture(res);          // default: WinPmem signed-driver path
     else
         RunCapture(res, g_selftest);    // experimental driverless path (or synthetic self-test)
@@ -2700,14 +2733,22 @@ static void UpdateStatus(const std::wstring& s, COLORREF col) {
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+// The driver checkbox and the Split drop-down only apply to a memory image.
+static void UpdateMemoryOptions(bool busy) {
+    bool mem = SendMessageW(g_chkMemory, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    EnableWindow(g_chkDriver, mem && !busy && !g_selftest);
+    EnableWindow(g_cmbSplit, mem && !busy);
+}
+
 static void SetBusy(bool busy) {
     EnableWindow(g_editPath, !busy);
     EnableWindow(g_btnBrowse, !busy);
     EnableWindow(g_btnCapture, !busy);
-    EnableWindow(g_cmbSplit, !busy);
-    EnableWindow(g_chkDriver, !busy);
+    UpdateMemoryOptions(busy);
+    EnableWindow(g_chkMemory, !busy && !g_selftest);
     EnableWindow(g_chkPagefile, !busy);
     EnableWindow(g_chkHiberfil, !busy);
+    EnableWindow(g_chkSwapfile, !busy);
     // Stop/Close is always clickable when entering either state; OnCloseButton
     // disables it only while a stop is in progress.
     EnableWindow(g_btnClose, TRUE);
@@ -2775,8 +2816,26 @@ static void OnCapture() {
         SetTextW(g_editPath, path);
     }
 
+    // What to collect. A self-test always writes its synthetic image and
+    // never collects system files.
+    g_captureMemory = g_selftest ||
+        (SendMessageW(g_chkMemory, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    g_collectPagefile = !g_selftest &&
+        (SendMessageW(g_chkPagefile, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    g_collectHiberfil = !g_selftest &&
+        (SendMessageW(g_chkHiberfil, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    g_collectSwapfile = !g_selftest &&
+        (SendMessageW(g_chkSwapfile, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    bool wantFiles = g_collectPagefile || g_collectHiberfil || g_collectSwapfile;
+    if (!g_captureMemory && !wantFiles) {
+        ShowSubWindow(0, L"Nothing to collect",
+                      L"Tick at least one of Memory image, Pagefile, Hibernation file or Swapfile.",
+                      L"OK", L"", L"", 460, 200);
+        return;
+    }
+
     // Driver mode (default): the checkbox, initialised from the command line.
-    g_driverMode = (!g_selftest &&
+    g_driverMode = (g_captureMemory && !g_selftest &&
                     (SendMessageW(g_chkDriver, BM_GETCHECK, 0, 0) == BST_CHECKED));
     std::wstring imagerProblem = g_driverMode ? CheckImagerAvailable() : L"";
     if (!imagerProblem.empty()) {
@@ -2797,14 +2856,12 @@ static void OnCapture() {
     // Driverless: OpenProcess(PID -1) fails with error 87 on current Windows.
     // Find that out now rather than after a whole run (which still collects the
     // pagefile / hibernation file, then reports the memory image as failed).
-    if (!g_driverMode && !g_selftest) {
+    if (g_captureMemory && !g_driverMode && !g_selftest) {
         EnableSeDebugPrivilege();
         HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, (DWORD)-1);
         DWORD code = hp ? 0 : GetLastError();
         if (hp) CloseHandle(hp);
         if (code) {
-            bool wantFiles = SendMessageW(g_chkPagefile, BM_GETCHECK, 0, 0) == BST_CHECKED ||
-                             SendMessageW(g_chkHiberfil, BM_GETCHECK, 0, 0) == BST_CHECKED;
             std::wstring why = L"The experimental driverless method does not work on this system "
                                L"(OpenProcess(PID -1) failed with error " + std::to_wstring(code) +
                                L"), so it cannot capture the memory image.";
@@ -2819,10 +2876,12 @@ static void OnCapture() {
             } else if (wantFiles) {
                 int r = ShowSubWindow(0, L"Memory capture unavailable",
                     why + L" The WinPmem imager is not available either.\n\n"
-                    L"Continue anyway? The pagefile / hibernation file will still be "
-                    L"collected, and the memory image will be reported as failed.",
-                    L"Continue", L"Cancel", L"", 520, 280);
+                    L"Collect the selected system files only?",
+                    L"Files only", L"Cancel", L"", 520, 260);
                 if (r != 1) return;
+                g_captureMemory = false;
+                SendMessageW(g_chkMemory, BM_SETCHECK, BST_UNCHECKED, 0);
+                UpdateMemoryOptions(false);
             } else {
                 ShowSubWindow(0, L"Memory capture unavailable",
                     why + L" The WinPmem imager is not available either.",
@@ -2836,42 +2895,35 @@ static void OnCapture() {
     {
         int sel = (int)SendMessageW(g_cmbSplit, CB_GETCURSEL, 0, 0);
         LRESULT mb = (sel >= 0) ? SendMessageW(g_cmbSplit, CB_GETITEMDATA, sel, 0) : 0;
-        g_splitBytes = (mb > 0 && mb != CB_ERR) ? (UINT64)mb * 1024 * 1024 : 0;
+        g_splitBytes = (g_captureMemory && mb > 0 && mb != CB_ERR) ? (UINT64)mb * 1024 * 1024 : 0;
     }
-
-    // Also-collect options (off during a synthetic self-test).
-    g_collectPagefile = !g_selftest &&
-        (SendMessageW(g_chkPagefile, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    g_collectHiberfil = !g_selftest &&
-        (SendMessageW(g_chkHiberfil, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
     // Size of the requested system files, for the disk-space check below.
     // (These live on the system volume, but worst-case the target is the same
     // volume; summing them is a conservative estimate.)
     UINT64 sysBytes = 0;
-    if (g_collectPagefile)
-        for (const auto& s : GetPagefilePaths()) if (FilePresent(s)) { sysBytes += GetFileBytes(s); break; }
-    if (g_collectHiberfil) {
-        std::wstring hp = GetHiberfilPath();
-        if (!hp.empty() && FilePresent(hp)) sysBytes += GetFileBytes(hp);
-    }
+    for (SysKind k : kSysKinds)
+        if (SysWanted(k))
+            for (const auto& s : SysFileSources(k)) if (FilePresent(s)) { sysBytes += GetFileBytes(s); break; }
 
     // Confirm overwrite (the single image, or parts from an earlier split capture).
     std::wstring base = path;
     StripExtensionInPlace(base);
-    bool imageExists = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool imageExists = g_captureMemory &&
+                       GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
     bool partsExist  = g_splitBytes &&
                        GetFileAttributesW(PartPath(base, 1).c_str()) != INVALID_FILE_ATTRIBUTES;
-    bool pagefileExists = g_collectPagefile &&
-        GetFileAttributesW((base + L"__pagefile.raw").c_str()) != INVALID_FILE_ATTRIBUTES;
-    bool hiberfilExists = g_collectHiberfil &&
-        GetFileAttributesW((base + L"__hiberfil.raw").c_str()) != INVALID_FILE_ATTRIBUTES;
-    if (imageExists || partsExist || pagefileExists || hiberfilExists) {
+    std::wstring sysExisting;                    // "__pagefile.raw already exists." lines
+    for (SysKind k : kSysKinds) {
+        std::wstring suffix = std::wstring(L"__") + SysName(k) + L".raw";
+        if (SysWanted(k) && GetFileAttributesW((base + suffix).c_str()) != INVALID_FILE_ATTRIBUTES)
+            sysExisting += L"\n" + suffix + L" already exists.";
+    }
+    if (imageExists || partsExist || !sysExisting.empty()) {
         std::wstring q;
         if (imageExists) { q += L"\""; q += path; q += L"\" already exists."; }
         else if (partsExist) { q += L"Split parts \""; q += PartPath(base, 1); q += L"\", ... already exist."; }
-        if (pagefileExists) { if (!q.empty()) q += L"\n"; q += L"__pagefile.raw already exists."; }
-        if (hiberfilExists) { if (!q.empty()) q += L"\n"; q += L"__hiberfil.raw already exists."; }
+        q += q.empty() ? sysExisting.substr(1) : sysExisting;
         q += L"\n\nOverwrite the existing file(s)?";
         if (ShowSubWindow(0, L"Overwrite?", q, L"Overwrite", L"Cancel", L"", 480, 240) != 1)
             return;
@@ -2880,20 +2932,21 @@ static void OnCapture() {
     // Disk-space sanity check. Splitting needs room for one extra part while it
     // moves data out of the image (see SplitImage). sysBytes is the actual size
     // of any requested pagefile / hibernation file (already measured above).
-    UINT64 needed = (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0);
+    UINT64 needed = g_captureMemory ? (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0) : 0;
     if (g_selftest) needed = 512u * 1024 * 1024;
     UINT64 splitExtra = (g_splitBytes && g_splitBytes < needed) ? g_splitBytes : 0;
     UINT64 freeB = 0;
     if (GetVolumeFreeBytes(path, freeB) &&
         freeB < needed + splitExtra + sysBytes + (UINT64)(1024 * 1024 * 1024)) {
-        std::wstring msg = L"Not enough free disk space.\n\n"
-                           L"Estimated image size: " +
-                           std::to_wstring((int)(needed / (1024 * 1024 * 1024)) + 1) +
-                           L" GB" +
-                           (splitExtra ? L" (+ " + FormatGB(splitExtra) + L" working space for splitting)"
-                                       : std::wstring()) +
+        std::wstring msg = L"Not enough free disk space.\n" +
+                           (needed ? L"\nEstimated image size: " +
+                                     std::to_wstring((int)(needed / (1024 * 1024 * 1024)) + 1) +
+                                     L" GB" +
+                                     (splitExtra ? L" (+ " + FormatGB(splitExtra) + L" working space for splitting)"
+                                                 : std::wstring())
+                                   : std::wstring()) +
                            (sysBytes ? L"\n"
-                                      L"Pagefile / hibernation files: " + FormatGB(sysBytes)
+                                      L"System files: " + FormatGB(sysBytes)
                                      : std::wstring()) +
                            L"\nFree space on target volume: " +
                            std::to_wstring((int)(freeB / (1024 * 1024 * 1024))) + L" GB";
@@ -2925,6 +2978,8 @@ static void OnCapture() {
     SendMessageW(g_progress, PBM_SETPOS, 0, 0);
     if (g_selftest)
         UpdateStatus(L"Running self-test (synthetic source)...", C.accent);
+    else if (!g_captureMemory)
+        UpdateStatus(L"Collecting system files...", C.accent);
     else if (g_driverMode)
         UpdateStatus(L"Capturing via WinPmem driver...", C.accent);
     else
@@ -2997,10 +3052,12 @@ static std::wstring SysFileSummary(const CaptureResult* r, const wchar_t* headin
     if (r->sysfiles.empty()) return std::wstring();
     std::wstring s = std::wstring(heading) + L"\n";
     for (const SysFileCapture& f : r->sysfiles) {
-        std::wstring label = (f.kind == L"pagefile") ? L"Pagefile  " : L"Hiberfile ";
+        std::wstring label = std::wstring(SysLabel(f.kind)) + L":";
         if (!f.path.empty()) {
             s += label + L" " + std::to_wstring(f.bytes / (1024 * 1024)) +
-                 L" MB -> " + f.path + L"\n";
+                 L" MB -> " + f.path + L"\n" +
+                 L"    SHA-256: " + (f.sha256.empty() ? std::wstring(L"not computed")
+                                                      : Utf8ToWide(f.sha256)) + L"\n";
         } else {
             s += label + L" " + (f.error.empty() ? L"not collected\n" : f.error + L"\n");
         }
@@ -3030,6 +3087,21 @@ static void OnCaptureFinished() {
         return;
     }
     if (!r) return;
+
+    if (!g_captureMemory) {                       // system files only
+        bool any = HasCollectedSysFile(r);
+        std::wstring dir = r->path;
+        size_t sl = dir.find_last_of(L"\\/");
+        if (sl != std::wstring::npos) dir = dir.substr(0, sl);
+        UpdateStatus(any ? L"Done - system files collected." : L"Collection failed.",
+                     any ? C.ok : C.danger);
+        ShowSubWindow(1, any ? L"Collection complete" : L"Collection failed",
+                      SysFileSummary(r, L"System files (no memory image requested):") +
+                      L"\nTime:   " + FormatDuration(r->seconds) + L"\n"
+                      L"\nStored locally. No data was transmitted anywhere.",
+                      L"Close", any ? L"Open folder" : L"", any ? dir : L"", 560, 320);
+        return;
+    }
 
     if (r->ok) {
         double mbps = (r->bytesWritten / 1024.0 / 1024.0) / (r->seconds > 0.0 ? r->seconds : 1.0);
@@ -3327,29 +3399,46 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_chkDriver, BM_SETCHECK,
                      (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        // Collect row (y 192..216), same columns as the options row: "Also"
-        // label, pagefile checkbox under the drop-down, hibernation checkbox
-        // under the driver checkbox. The checkboxes carry their own access
-        // keys (Alt+P, Alt+H); the label is decorative.
-        g_lblCollect = CreateWindowExW(0, L"STATIC", L"Also",
+        // Collect row (y 192..216): "Collect" label, then the memory image
+        // (under the drop-down), pagefile, hibernation file (under the driver
+        // checkbox) and swapfile. Unticking Memory image collects only the
+        // system files. The checkboxes carry their own access keys (Alt+M,
+        // Alt+P, Alt+H, Alt+W); the label is decorative.
+        g_lblCollect = CreateWindowExW(0, L"STATIC", L"Collect",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
                                        S(kPad), S(192), S(38), S(24),
                                        hwnd, nullptr, hInst, nullptr);
         SendMessageW(g_lblCollect, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        g_chkPagefile = CreateWindowExW(0, L"BUTTON", L"&Pagefile (pagefile.sys)",
+        g_chkMemory = CreateWindowExW(0, L"BUTTON", L"&Memory image",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
+                                      S(kPad + 40), S(193), S(100), S(22),
+                                      hwnd, (HMENU)IDC_CHK_MEMORY, hInst, nullptr);
+        SendMessageW(g_chkMemory, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkMemory, BM_SETCHECK,
+                     (g_cliNoMemory && !g_selftest) ? BST_UNCHECKED : BST_CHECKED, 0);
+        g_chkPagefile = CreateWindowExW(0, L"BUTTON", L"&Pagefile",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                        S(kPad + 40), S(193), S(kCol2 - 8 - kPad - 40), S(22),
+                                        S(kPad + 148), S(193), S(kCol2 - 8 - kPad - 148), S(22),
                                         hwnd, (HMENU)IDC_CHK_PAGEFILE, hInst, nullptr);
         SendMessageW(g_chkPagefile, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkPagefile, BM_SETCHECK,
                      (g_cliCollectPagefile && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
-        g_chkHiberfil = CreateWindowExW(0, L"BUTTON", L"&Hibernation file (hiberfil.sys)",
+        g_chkHiberfil = CreateWindowExW(0, L"BUTTON", L"&Hibernation file",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                        S(kCol2), S(193), S(W - kPad - kCol2), S(22),
+                                        S(kCol2), S(193), S(104), S(22),
                                         hwnd, (HMENU)IDC_CHK_HIBERFIL, hInst, nullptr);
         SendMessageW(g_chkHiberfil, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkHiberfil, BM_SETCHECK,
                      (g_cliCollectHiberfil && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
+        g_chkSwapfile = CreateWindowExW(0, L"BUTTON", L"S&wapfile",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
+                                        S(kCol2 + 112), S(193), S(W - kPad - kCol2 - 112), S(22),
+                                        hwnd, (HMENU)IDC_CHK_SWAPFILE, hInst, nullptr);
+        SendMessageW(g_chkSwapfile, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkSwapfile, BM_SETCHECK,
+                     (g_cliCollectSwapfile && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(g_chkMemory, !g_selftest);
+        UpdateMemoryOptions(false);
 
         // Progress bar (y 232, 6px), percentage drawn to its right in DrawMain.
         g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
@@ -3422,7 +3511,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORSTATIC:
         // Checkboxes and labels sit on the grey body background, not on white boxes.
         if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver ||
-            (HWND)lp == g_chkPagefile || (HWND)lp == g_chkHiberfil) {
+            (HWND)lp == g_chkMemory || (HWND)lp == g_chkPagefile || (HWND)lp == g_chkHiberfil ||
+            (HWND)lp == g_chkSwapfile) {
             SetBkColor((HDC)wp, C.bg);
             SetTextColor((HDC)wp, C.secText);
             return (LRESULT)g_brBg;
@@ -3472,6 +3562,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case IDC_BTN_SPLITHELP: OnSplitHelp(); return 0;
+        case IDC_CHK_MEMORY:
+            UpdateMemoryOptions(g_capturing);
+            return 0;
         case IDC_CHK_DRIVER:
             // Just reflect the checkbox into g_driverMode; OnCapture is the only
             // consumer and it re-reads this each time.
@@ -3671,9 +3764,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 g_cliCollectPagefile = true;               // also collect pagefile.sys
             } else if (_wcsicmp(t.c_str(), L"--hiberfil") == 0) {
                 g_cliCollectHiberfil = true;               // also collect hiberfil.sys
+            } else if (_wcsicmp(t.c_str(), L"--swapfile") == 0) {
+                g_cliCollectSwapfile = true;               // also collect swapfile.sys
             } else if (_wcsicmp(t.c_str(), L"--system-files") == 0) {
                 g_cliCollectPagefile = true;
-                g_cliCollectHiberfil = true;               // both
+                g_cliCollectHiberfil = true;
+                g_cliCollectSwapfile = true;               // all three
+            } else if (_wcsicmp(t.c_str(), L"--no-memory") == 0) {
+                g_cliNoMemory = true;                      // system files only
             } else if (_wcsicmp(t.c_str(), L"--split") == 0 && k + 1 < toks.size()) {
                 // --split <MB>: preselect a part size (0 = no split). Invalid
                 // values are ignored and the drop-down keeps its default.
@@ -3809,7 +3907,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         // manager below only moves focus to a checkbox for its access key.)
         if (m.message == WM_SYSCHAR && (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd))) {
             HWND hit = nullptr;
-            for (HWND c : { g_chkTop, g_chkDriver, g_chkPagefile, g_chkHiberfil }) {
+            for (HWND c : { g_chkTop, g_chkDriver, g_chkMemory, g_chkPagefile, g_chkHiberfil, g_chkSwapfile }) {
                 wchar_t t[128] = L"";
                 GetWindowTextW(c, t, 128);
                 const wchar_t* amp = wcschr(t, L'&');

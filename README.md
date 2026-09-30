@@ -36,9 +36,9 @@ forensic analysts time and avoid mistakes, not to replace WinPmem.
   FAT32-safe 4 GB option.
 - **Live progress** for the capture and the hashing step, with **Stop** at any
   time (the partial image is kept).
-- **Pagefile / hibernation file collection:** optionally collect
-  `pagefile.sys` and `hiberfil.sys` alongside the memory image, each with its
-  own SHA-256 and `.meta` sidecar.
+- **Pagefile / hibernation file / swapfile collection:** optionally collect
+  `pagefile.sys`, `hiberfil.sys` and `swapfile.sys` alongside the memory image,
+  or on their own, each with its own SHA-256 and `.meta` sidecar.
 - **Safety checks:** overwrite prompt, free-space check, and a warning if you
   close the window during a capture.
 
@@ -62,8 +62,10 @@ with **Alt**:
 | Alt+B | Browse… |
 | Alt+L | Split drop-down |
 | Alt+D | Use WinPmem driver |
-| Alt+P | Also collect pagefile.sys |
-| Alt+H | Also collect hiberfil.sys |
+| Alt+M | Collect memory image |
+| Alt+P | Collect pagefile.sys |
+| Alt+H | Collect hiberfil.sys |
+| Alt+W | Collect swapfile.sys |
 | Alt+A | Always on top |
 | Alt+I / Alt+V / Alt+U | Disclaimer / Privacy Policy / Terms of Use |
 | F1 | About |
@@ -80,7 +82,9 @@ RAMstain.exe --driver "C:\tools\winpmem.exe"   use an external imager instead of
 RAMstain.exe --no-driver                  select the experimental driverless method
 RAMstain.exe --pagefile                   also collect pagefile.sys
 RAMstain.exe --hiberfil                   also collect hiberfil.sys
-RAMstain.exe --system-files               also collect both pagefile and hibernation file
+RAMstain.exe --swapfile                   also collect swapfile.sys
+RAMstain.exe --system-files               also collect pagefile, hibernation file and swapfile
+RAMstain.exe --no-memory --system-files   system files only, no memory image
 RAMstain.exe --selftest "C:\out\test.raw" 512 MB synthetic test, no real memory read
 ```
 
@@ -95,6 +99,7 @@ variable. Both the classic WinPmem 2.x and the Go imager (`go-winpmem`) work.
 | `<name>.meta` | Image path, host, OS/kernel, capture start and finish (UTC and local), size, SHA-256, tool version, method, and per-part hashes when split. |
 | `<name>__pagefile.raw` + `.meta` | Collected pagefile (if requested), with its own size, SHA-256 and source path. |
 | `<name>__hiberfil.raw` + `.meta` | Collected hibernation file (if requested), same sidecar format. |
+| `<name>__swapfile.raw` + `.meta` | Collected swapfile (if requested), same sidecar format. |
 
 Example `host1.meta`:
 
@@ -136,11 +141,18 @@ on FAT32/exFAT drives. The **?** button next to the Split drop-down shows these
 steps in the app, including a PowerShell one-liner for many parts and the
 Linux/macOS `cat` command.
 
-## Collecting the pagefile and hibernation file
+## Collecting the pagefile, hibernation file and swapfile
 
-Tick **Pagefile** and/or **Hibernation file** in the **Also** row (or pass
-`--pagefile` / `--hiberfil` / `--system-files`) to copy `pagefile.sys` and
-`hiberfil.sys` to the same folder as the memory image, right after the capture.
+Tick **Pagefile**, **Hibernation file** and/or **Swapfile** in the **Collect**
+row (or pass `--pagefile` / `--hiberfil` / `--swapfile` / `--system-files`) to
+copy `pagefile.sys`, `hiberfil.sys` and `swapfile.sys` (the swap file for
+Store apps) to the same folder as the memory image, right after the capture.
+Each copy's size, path and SHA-256 are shown when it finishes and recorded in
+its `.meta` sidecar.
+
+To collect only these files, untick **Memory image** (or pass `--no-memory`).
+No memory image is written, and the WinPmem driver and Split options do not
+apply. The files are named after the save path, e.g. `host1__pagefile.raw`.
 
 - No kernel driver is needed. Windows keeps these files open with no sharing,
   so even an Administrator cannot open them normally; RAMstain locates the
@@ -149,11 +161,11 @@ Tick **Pagefile** and/or **Hibernation file** in the **Also** row (or pass
   copy reflects their contents at the time each part is read. The volume must
   be NTFS.
 - The pagefile is located from the system's `ExistingPageFiles` setting (it may
-  live on any volume); the hibernation file from the system volume. If a file does
+  live on any volume); the hibernation file and swapfile from the system volume. If a file does
   not exist — the pagefile or hibernation is disabled — the run notes it and
   writes a `.meta` sidecar recording that nothing was collected.
-- Collection is independent of the memory capture: a pagefile/hibernation file
-  is still collected (and reported) even if the memory image itself fails or is
+- Collection is independent of the memory capture: a system file is still
+  collected (and reported) even if the memory image itself fails or is
   stopped. Stopping during collection discards the partial system file.
 
 ## How it captures
