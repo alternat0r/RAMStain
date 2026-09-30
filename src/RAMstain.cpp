@@ -14,6 +14,7 @@
 //  Output:
 //    <name>.raw   physical memory image, 4 KiB page-aligned
 //    <name>.meta  capture metadata (host, OS, kernel, size, SHA-256)
+//    <name>.log   timestamped run log (options, steps, errors, results); appended per run
 //
 //  UI: modern flat theme (dark header band, cards, rounded owner-drawn
 //      buttons, themed progress bar), Disclaimer / Privacy / Terms dialogs.
@@ -608,6 +609,75 @@ static std::wstring FormatUtcAndLocal(FILETIME ft) {
     return buf;
 }
 
+// ---------------------------------------------------------------------------
+//  Run log (<image base>.log)
+//
+//  Each run appends a timestamped record - options, method, every phase,
+//  errors, and the results with their hashes - to a text log next to the
+//  image. Entries are written and flushed as they happen, so the log survives
+//  an interrupted run, and appending keeps the history of earlier runs to the
+//  same name. The worker and UI threads both log, so writes are serialized.
+// ---------------------------------------------------------------------------
+class RunLog {
+public:
+    // Open for appending (created if missing). On failure the run goes ahead
+    // without a log and Path() is empty.
+    bool Open(const std::wstring& path) {
+        Close();
+        m_h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        m_path = (m_h != INVALID_HANDLE_VALUE) ? path : std::wstring();
+        return !m_path.empty();
+    }
+    void Close() {
+        AcquireSRWLockExclusive(&m_lock);
+        if (m_h != INVALID_HANDLE_VALUE) CloseHandle(m_h);
+        m_h = INVALID_HANDLE_VALUE;
+        ReleaseSRWLockExclusive(&m_lock);
+    }
+    const std::wstring& Path() const { return m_path; }   // kept after Close()
+
+    // One entry, "2026-09-30T13:14:24.123Z  text"; further lines of a
+    // multi-line text are indented under it.
+    void Line(const std::wstring& text) {
+        SYSTEMTIME u;
+        GetSystemTime(&u);
+        wchar_t ts[32];
+        _snwprintf_s(ts, _countof(ts), _TRUNCATE, L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ  ",
+                     u.wYear, u.wMonth, u.wDay, u.wHour, u.wMinute, u.wSecond, u.wMilliseconds);
+        std::wstring line = ts;
+        for (wchar_t c : text) {
+            if (c == L'\n') line += L"\r\n" + std::wstring(26, L' ');
+            else if (c != L'\r') line += c;
+        }
+        line += L"\r\n";
+        std::string u8 = WideToUtf8(line);
+        AcquireSRWLockExclusive(&m_lock);
+        if (m_h != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(m_h, u8.data(), (DWORD)u8.size(), &wr, nullptr);
+            FlushFileBuffers(m_h);
+        }
+        ReleaseSRWLockExclusive(&m_lock);
+    }
+
+private:
+    HANDLE       m_h = INVALID_HANDLE_VALUE;
+    std::wstring m_path;
+    SRWLOCK      m_lock = SRWLOCK_INIT;
+};
+static RunLog g_log;
+
+// Tell the UI which phase the worker is in (wParam = CapturePhase) and how
+// many bytes that phase expects in total (lParam, 0 = unknown); log it too.
+static void PostPhase(CapturePhase phase, UINT64 totalBytes) {
+    static const wchar_t* kNames[] = { L"Capturing memory image", L"Hashing image (SHA-256)",
+                                       L"Splitting image into parts", L"Collecting system files" };
+    g_log.Line(std::wstring(L"Phase: ") + kNames[(int)phase] +
+               (totalBytes ? L" (" + std::to_wstring(totalBytes) + L" bytes expected)" : L""));
+    PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)phase, (LPARAM)totalBytes);
+}
+
 // A whole-image hash (res->sha256) as shown in the .meta sidecar
 // and the completion dialog.
 static std::wstring HashText(const CaptureResult* res, const std::string& hash) {
@@ -740,7 +810,7 @@ static void SplitImage(CaptureResult* res) {
     for (UINT64 k = 1; DeleteFileW(PartPath(base, k).c_str()) ||
                        GetLastError() != ERROR_FILE_NOT_FOUND; ++k) {}
 
-    PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)CapturePhase::Splitting, (LPARAM)(total - ps));
+    PostPhase(CapturePhase::Splitting, total - ps);
     PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, 0);
 
     std::vector<SplitPart> parts((size_t)n);
@@ -810,7 +880,14 @@ static void SplitImage(CaptureResult* res) {
 // Last step of every capture: split (if requested), then write the .meta sidecar.
 static void FinishImage(CaptureResult* res, bool selftest) {
     SplitImage(res);
+    if (!res->parts.empty())
+        g_log.Line(L"Split into " + std::to_wstring(res->parts.size()) + L" parts: " +
+                   res->parts.front().path + L" ... " + res->parts.back().path);
+    if (!res->splitError.empty())
+        g_log.Line(L"Split incomplete: " + res->splitError);
     WriteMetaSidecar(res, selftest);
+    if (!res->metaPath.empty())
+        g_log.Line(L"Metadata sidecar written: " + res->metaPath);
 }
 
 static void RunCapture(CaptureResult* res, bool selftest) {
@@ -886,7 +963,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
     // SHA-256 (plus per-part hashes if the image will be split) on background
     // threads while streaming.
     HashPipeline hash(kChunkBytes, g_splitBytes);
-    PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)CapturePhase::Capturing, (LPARAM)neededBytes);
+    PostPhase(CapturePhase::Capturing, neededBytes);
 
     UINT64 offset = 0;
     bool   anyWritten = false;
@@ -945,8 +1022,11 @@ static void RunCapture(CaptureResult* res, bool selftest) {
     if (aborted) return;
     res->ok = res->bytesWritten > 0;
     // A user-stopped (partial) image gets no hashes, same as the driver path.
-    if (!res->cancelled)
+    if (!res->cancelled) {
         res->sha256 = hash.Finish(&res->partSha256);
+        g_log.Line(L"Image SHA-256: " + Utf8ToWide(res->sha256) + L" (" +
+                   std::to_wstring(res->bytesWritten) + L" bytes)");
+    }
 
     // Split if requested, then write the .meta sidecar (shared with the driver path).
     FinishImage(res, selftest);
@@ -1176,12 +1256,6 @@ static UINT64 GetFileBytes(const std::wstring& path) {
     return ok ? (UINT64)sz.QuadPart : 0;
 }
 
-// Tell the UI which phase the worker is in (wParam = CapturePhase) and how
-// many bytes that phase expects in total (lParam, 0 = unknown).
-static void PostPhase(CapturePhase phase, UINT64 totalBytes) {
-    PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)phase, (LPARAM)totalBytes);
-}
-
 // Compute the SHA-256 of a completed image in one pass into res->sha256
 // (no-op if the file is missing). Only called for images that were
 // not stopped mid-capture. If the user presses Stop while hashing, the hashes
@@ -1205,12 +1279,16 @@ static void HashFile(CaptureResult* res) {
     for (;;) {
         if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) {
             res->hashStopped = true;
+            g_log.Line(L"Hashing stopped by user after " + std::to_wstring(done) +
+                       L" bytes; no hash recorded.");
             CloseHandle(hf);
             return;
         }
         BYTE* buf = hash.Acquire();
         DWORD rd = 0;
         if (!ReadFile(hf, buf, kBlock, &rd, nullptr)) {
+            g_log.Line(L"Hashing failed: read error " + std::to_wstring(GetLastError()) +
+                       L" at offset " + std::to_wstring(done) + L"; no hash recorded.");
             CloseHandle(hf);                 // read error: no hash rather than a
             return;                          // hash of a truncated image
         }
@@ -1225,6 +1303,7 @@ static void HashFile(CaptureResult* res) {
     }
     CloseHandle(hf);
     res->sha256 = hash.Finish(&res->partSha256);
+    g_log.Line(L"Image SHA-256: " + Utf8ToWide(res->sha256) + L" (" + std::to_wstring(done) + L" bytes)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1780,6 +1859,7 @@ static void CollectSystemFile(CaptureResult* res, SysKind kind) {
              : kind == SysKind::Hiberfil ? L"hibernation may be disabled"
                                          : L"Windows creates it only when needed") +
             L"). Nothing to collect.";
+        g_log.Line(sf.error);
         if (!sources.empty()) sf.source = sources[0];
         // Still write a sidecar (next to where the image would go) recording it.
         std::wstring metaPath = dst;
@@ -1793,7 +1873,13 @@ static void CollectSystemFile(CaptureResult* res, SysKind kind) {
 
     // (Don't reset the progress bar here: it still shows the memory-capture
     // percentage, and CopySystemFile posts 0..100 of its own as it copies.)
+    g_log.Line(L"Collecting " + src + L" -> " + dst);
     bool ok = CopySystemFile(src, dst, sf);
+    if (ok)
+        g_log.Line(std::wstring(SysName(kind)) + L".sys collected: " + std::to_wstring(sf.bytes) +
+                   L" bytes, SHA-256 " + Utf8ToWide(sf.sha256) + L"\nMethod: " + sf.method);
+    else
+        g_log.Line(std::wstring(SysName(kind)) + L".sys not collected: " + sf.error);
     std::wstring metaPath = dst;
     StripExtensionInPlace(metaPath);
     metaPath += L".meta";
@@ -1878,6 +1964,8 @@ static void RunDriverCapture(CaptureResult* res) {
         ? L"\"" + imager + L"\" acquire \"" + res->path + L"\""
         : L"\"" + imager + L"\" \"" + res->path + L"\"";
     std::wstring unloadArgs = (kind == ImagerKind::Go) ? L" uninstall" : L" -u";
+    g_log.Line(L"WinPmem imager: " + imager + L" (" + kindName + L")");
+    g_log.Line(L"Imager command: " + cmdline);
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
@@ -1910,6 +1998,8 @@ static void RunDriverCapture(CaptureResult* res) {
         return;
     }
 
+    g_log.Line(L"Imager started (PID " + std::to_wstring(pi.dwProcessId) + L")");
+
     // The image is expected to be about the size of installed RAM. WinPmem pads
     // gaps in the physical address space, so the file can end up somewhat
     // larger; the bar is held at 99% until the imager actually exits.
@@ -1924,6 +2014,7 @@ static void RunDriverCapture(CaptureResult* res) {
         DWORD stopWait = WaitForAnyStop(WAIT_TIMEOUT, 250);
         if (stopWait == WAIT_OBJECT_0) { // user pressed Stop
             res->cancelled = true;
+            g_log.Line(L"Stop: terminating the imager");
             TerminateProcess(pi.hProcess, 0);
             break;
         }
@@ -1948,6 +2039,8 @@ static void RunDriverCapture(CaptureResult* res) {
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    g_log.Line(L"Imager exited (exit code " + std::to_wstring(exitCode) + L"); image file is " +
+               std::to_wstring(GetFileBytes(res->path)) + L" bytes");
 
     // WinPmem unloads its driver when it exits normally; belt-and-suspenders
     // (and required after a Stop, since TerminateProcess skips its cleanup).
@@ -1960,8 +2053,14 @@ static void RunDriverCapture(CaptureResult* res) {
         if (CreateProcessW(imager.c_str(), ub.data(), nullptr, nullptr, FALSE,
                            0, nullptr, imagerDir.c_str(), &si2, &pi2)) {
             WaitForSingleObject(pi2.hProcess, 8000);
+            DWORD uc = STILL_ACTIVE;
+            GetExitCodeProcess(pi2.hProcess, &uc);
             CloseHandle(pi2.hProcess);
             CloseHandle(pi2.hThread);
+            g_log.Line(L"Driver unload: " + uninstCmd + L" (exit code " + std::to_wstring(uc) + L")");
+        } else {
+            g_log.Line(L"Driver unload could not be started (error " +
+                       std::to_wstring(GetLastError()) + L"): " + uninstCmd);
         }
     }
 
@@ -2828,6 +2927,80 @@ static void OnBrowse() {
         SetTextW(g_editPath, fileBuf.data());
 }
 
+// Open <base>.log (appending) and write the run header: tool, system, user,
+// command line, and the options chosen for this run.
+static void LogRunStart(const std::wstring& path, UINT64 freeBytes) {
+    std::wstring base = path;
+    StripExtensionInPlace(base);
+    g_log.Open(base + L".log");
+    wchar_t user[256] = L"";
+    DWORD un = _countof(user);
+    if (!GetUserNameW(user, &un)) lstrcpyW(user, L"(unknown)");
+    bool elevated = false;
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION te = {};
+        DWORD cb = 0;
+        elevated = GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &cb) && te.TokenIsElevated;
+        CloseHandle(tok);
+    }
+    std::wstring collect;
+    auto add = [&](bool on, const wchar_t* what) { if (on) collect += (collect.empty() ? L"" : L", ") + std::wstring(what); };
+    add(g_captureMemory, g_selftest ? L"memory image (SELF-TEST, synthetic)"
+                         : g_driverMode ? L"memory image (WinPmem driver)"
+                                        : L"memory image (driverless, experimental)");
+    add(g_collectPagefile, L"pagefile.sys");
+    add(g_collectHiberfil, L"hiberfil.sys");
+    add(g_collectSwapfile, L"swapfile.sys");
+    g_log.Line(std::wstring(L"==== RAMstain ") + kVersionStr + L" run started ====\n"
+               L"Time:        " + FormatUtcAndLocal(FILETIME{}) + L"\n"
+               L"Host:        " + GetComputerName() + L"\n"
+               L"OS:          " + GetOsVersionString() + L"\n"
+               L"User:        " + user + (elevated ? L" (elevated)" : L" (not elevated)") + L"\n"
+               L"Process:     PID " + std::to_wstring(GetCurrentProcessId()) + L"\n"
+               L"Command:     " + GetCommandLineW() + L"\n"
+               L"Output:      " + path + L"\n"
+               L"Collect:     " + collect + L"\n"
+               L"Split:       " + (g_splitBytes ? FormatGB(g_splitBytes) + L" parts" : std::wstring(L"none")) + L"\n"
+               L"Free space:  " + (freeBytes ? FormatGB(freeBytes) : std::wstring(L"unknown")) +
+               L" on the target volume");
+}
+
+// The run's outcome, results and hashes, then close the log.
+static void LogRunEnd(const CaptureResult* r) {
+    std::wstring m = L"Run finished after " + FormatDuration(r->seconds) + L"\n";
+    if (!g_captureMemory)
+        m += L"Memory image: not requested\n";
+    else if (r->ok) {
+        m += std::wstring(L"Memory image: ") +
+             (r->cancelled ? L"stopped by user (partial)" : r->hashStopped ? L"complete, hash skipped (stopped)"
+                                                                            : L"complete") +
+             L", " + std::to_wstring(r->bytesWritten) + L" bytes\n";
+        m += L"Image:       " + (r->parts.empty() ? r->path
+                                                   : std::to_wstring(r->parts.size()) + L" parts, " +
+                                                     r->parts.front().path + L" ...") + L"\n";
+        m += L"SHA-256:     " + HashText(r, r->sha256) + L"\n";
+        for (const SplitPart& part : r->parts)
+            m += L"  " + part.path.substr(part.path.find_last_of(L"\\/") + 1) + L"  " +
+                 (part.sha256.empty() ? std::wstring(L"not computed") : Utf8ToWide(part.sha256)) + L"\n";
+        if (!r->method.empty()) m += L"Method:      " + r->method + L"\n";
+    } else {
+        m += L"Memory image: FAILED\nError:       " + (r->error.empty() ? std::wstring(L"unknown") : r->error) + L"\n";
+    }
+    for (const SysFileCapture& f : r->sysfiles)
+        m += std::wstring(SysName(f.kind)) + L".sys: " +
+             (!f.path.empty() ? std::to_wstring(f.bytes) + L" bytes, SHA-256 " + Utf8ToWide(f.sha256)
+                              : L"not collected - " + f.error) + L"\n";
+    m += L"==== run ended ====";
+    g_log.Line(m);
+    g_log.Close();
+}
+
+// "Run log:" line for the result dialogs (empty when no log could be written).
+static std::wstring LogNote() {
+    return g_log.Path().empty() ? std::wstring() : L"\nRun log:\n" + g_log.Path() + L"\n";
+}
+
 static void OnCapture() {
     if (g_capturing) return;
 
@@ -3019,6 +3192,7 @@ static void OnCapture() {
     s_res = CaptureResult();
     s_res.path = path;
     g_activeResult = &s_res;
+    LogRunStart(path, freeB);
 
     HANDLE th = CreateThread(nullptr, 0, CaptureThreadProc, &s_res, 0, nullptr);
     if (!th) {
@@ -3040,6 +3214,7 @@ static bool StopRequested() {
 }
 
 static void RequestStop() {
+    g_log.Line(L"Stop requested by user");
     if (g_stopEvent) SetEvent(g_stopEvent);
     UpdateStatus(L"Stopping capture...", C.muted);
     EnableWindow(g_btnClose, FALSE);
@@ -3127,6 +3302,7 @@ static void OnCaptureFinished() {
 
     CaptureResult* r = g_activeResult;
     g_activeResult = nullptr;
+    if (r) LogRunEnd(r);
     if (g_stopEvent) { CloseHandle(g_stopEvent); g_stopEvent = nullptr; }
     if (g_closeAfterStop) {           // "Stop and close": files are written, exit
         g_closeAfterStop = false;
@@ -3144,7 +3320,7 @@ static void OnCaptureFinished() {
                      any ? C.ok : C.danger);
         ShowSubWindow(1, any ? L"Collection complete" : L"Collection failed",
                       SysFileSummary(r, L"System files (no memory image requested):") +
-                      L"\nTime:   " + FormatDuration(r->seconds) + L"\n"
+                      L"\nTime:   " + FormatDuration(r->seconds) + L"\n" + LogNote() +
                       L"\nStored locally. No data was transmitted anywhere.",
                       L"Close", any ? L"Open folder" : L"", any ? dir : L"", 560, 320,
                       HashList(r));
@@ -3178,6 +3354,7 @@ static void OnCaptureFinished() {
         if (!sys.empty()) msg += L"\n" + sys;
         if (!r->metaPath.empty())
             msg += L"\nMetadata sidecar:\n" + r->metaPath + L"\n";
+        msg += LogNote();
         if (!r->parts.empty())
             msg += L"\nThe hashes are of the whole image; per-part hashes are in the .meta file.\n";
         msg += L"\nStored locally. No data was transmitted anywhere.";
@@ -3201,13 +3378,13 @@ static void OnCaptureFinished() {
             ShowSubWindow(1, L"System files collected; memory capture failed",
                           SysFileSummary(r, L"Collected:") +
                           L"\nThe memory image was not captured:\n" +
-                          (r->error.empty() ? L"Memory capture failed." : r->error),
+                          (r->error.empty() ? L"Memory capture failed." : r->error) + L"\n" + LogNote(),
                           L"Close", L"Open folder", dir, 560, 380, HashList(r));
             return;
         }
         UpdateStatus(L"Capture failed.", C.danger);
         ShowSubWindow(1, L"Capture failed",
-                      r->error.empty() ? L"Capture failed." : r->error,
+                      (r->error.empty() ? L"Capture failed." : r->error) + L"\n" + LogNote(),
                       L"Close", L"", L"", 560, 380);
     }
 }

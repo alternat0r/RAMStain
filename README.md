@@ -99,6 +99,7 @@ variable. Both the classic WinPmem 2.x and the Go imager (`go-winpmem`) work.
 |------|----------|
 | `<name>.raw` | Physical memory image. With splitting: `<name>.001`, `<name>.002`, … |
 | `<name>.meta` | Image path, host, OS/kernel, capture start and finish (UTC and local), size, SHA-256, tool version, method, and per-part hashes when split. |
+| `<name>.log` | Run log: a timestamped (UTC, millisecond) record of each run — host, user, command line, options, every step (imager start and exit code, hashing, splitting, each system file and how it was read), errors, and the final results with their SHA-256. Written as the run happens, so it survives an interrupted run; later runs to the same name are appended. |
 | `<name>__pagefile.raw` + `.meta` | Collected pagefile (if requested), with its own size, SHA-256 and source path. |
 | `<name>__hiberfil.raw` + `.meta` | Collected hibernation file (if requested), same sidecar format. |
 | `<name>__swapfile.raw` + `.meta` | Collected swapfile (if requested), same sidecar format. |
