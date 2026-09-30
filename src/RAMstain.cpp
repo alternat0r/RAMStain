@@ -1506,6 +1506,13 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         (void)b1;
         return 0;
     }
+    case WM_NCHITTEST: {
+        // Drag the dialog from anywhere on its own surface (About header and
+        // body, margins around the text box), like the main window. Buttons
+        // and the text box are child windows and answer their own hit tests.
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+        return (hit == HTCLIENT) ? HTCAPTION : hit;
+    }
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
         SetTextColor((HDC)wp, C.text);
