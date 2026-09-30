@@ -73,8 +73,11 @@
 #define IDC_SUB_SECOND   2003
 #define IDC_SUB_OK       2004
 
-#define WM_APP_PROGRESS (WM_APP + 1)   // wParam = percent
+#define WM_APP_PROGRESS (WM_APP + 1)   // wParam = percent, lParam = bytes done in this phase
 #define WM_APP_FINISHED (WM_APP + 2)
+#define WM_APP_PHASE    (WM_APP + 3)   // wParam = CapturePhase, lParam = expected total bytes (0 = unknown)
+
+enum class CapturePhase { Capturing = 0, Hashing = 1 };
 
 static const wchar_t* kWindowClass = L"RAMstain.MainWindow";
 static const wchar_t* kSubClass    = L"RAMstain.SubWindow";
@@ -131,6 +134,8 @@ static std::wstring g_cliPath;
 
 static std::wstring g_status;        // status line text
 static COLORREF     g_statusColor;   // status line color
+static CapturePhase g_phase = CapturePhase::Capturing; // current worker phase (UI thread)
+static UINT64       g_phaseTotal = 0;                  // expected bytes for g_phase (0 = unknown)
 
 enum class BtnStyle { Primary, Secondary, Danger, Link };
 struct BtnState { BtnStyle style; bool hover; };
@@ -138,7 +143,8 @@ static std::map<HWND, BtnState> g_btns;
 
 struct CaptureResult {
     bool      ok = false;
-    bool      cancelled = false;
+    bool      cancelled = false;         // Stop pressed during capture (partial image, no MD5)
+    bool      hashStopped = false;       // Stop pressed while hashing a complete image (no MD5)
     UINT      errCode = 0;
     UINT64    pagesWritten = 0;
     UINT64    bytesWritten = 0;
@@ -278,6 +284,13 @@ static std::wstring FormatDuration(double sec) {
     return b;
 }
 
+static std::wstring FormatGB(UINT64 bytes) {
+    wchar_t b[32];
+    _snwprintf_s(b, _countof(b), _TRUNCATE, L"%.1f GB",
+                 (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    return b;
+}
+
 // Free space on the volume containing `path`.
 static bool GetVolumeFreeBytes(const std::wstring& path, UINT64& freeBytes) {
     std::wstring root = path;
@@ -319,6 +332,13 @@ static void FillSynthetic(BYTE* buf, size_t n, UINT64 off) {
         buf[i] = (BYTE)((off + i) ^ ((off + i) >> 8) ^ ((off + i) >> 16));
 }
 
+// MD5 as shown in the .meta sidecar and the completion dialog.
+static std::wstring Md5Text(const CaptureResult* res) {
+    if (!res->md5.empty()) return Utf8ToWide(res->md5);
+    if (res->cancelled || res->hashStopped) return L"not computed (stopped by user)";
+    return L"not computed";
+}
+
 // Write the .meta sidecar for a completed capture. Used by both the driverless
 // and WinPmem-driver paths so every RAMstain image gets the same documentation.
 static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
@@ -341,14 +361,15 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
         L"Captured:    " + capTime + L" (local time)\n" +
         L"Size:        " + std::to_wstring(res->bytesWritten) + L" bytes\n" +
         L"Pages:       " + std::to_wstring(res->pagesWritten) + L" x 4096 bytes\n" +
-        L"MD5:         " + Utf8ToWide(res->md5) + L"\n" +
+        L"MD5:         " + Md5Text(res) + L"\n" +
         L"Tool:        RAMstain " + kVersionStr + L"\n" +
         L"Method:      " + (selftest
             ? std::wstring(L"SELF-TEST synthetic source (not a memory capture)\n")
             : (res->method.empty()
                 ? std::wstring(L"Driverless OpenProcess(PID -1) + ReadProcessMemory (experimental)\n")
                 : (res->method + L"\n"))) +
-        (res->cancelled ? L"Note:        Capture stopped by user (partial image)\n" : L"");
+        (res->cancelled ? L"Note:        Capture stopped by user (partial image, not hashed)\n" : L"") +
+        (res->hashStopped ? L"Note:        Image complete; MD5 skipped (stopped by user during hashing)\n" : L"");
     std::string metaUtf8 = WideToUtf8(meta);
     HANDLE hm = CreateFileW(metaPath.c_str(), GENERIC_WRITE, 0, nullptr,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -433,6 +454,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 
     MD5 md5;
     std::vector<BYTE> buf(kChunkBytes);
+    PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)CapturePhase::Capturing, (LPARAM)neededBytes);
 
     UINT64 offset = 0;
     bool   anyWritten = false;
@@ -479,17 +501,18 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 
         int pct = (int)((double)offset / (double)neededBytes * 100.0);
         if (pct > 100) pct = 100;
-        PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0);
+        PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)pct, (LPARAM)offset);
 
         if (offset >= neededBytes) break;
     }
 
-    std::string md5Hex = md5.Hex();
     cleanup();
 
     if (aborted) return;
     res->ok = res->bytesWritten > 0;
-    res->md5 = md5Hex;
+    // A user-stopped (partial) image gets no MD5, same as the driver path.
+    if (!res->cancelled)
+        res->md5 = md5.Hex();
 
     // Write .meta sidecar next to the image (shared with the driver path).
     WriteMetaSidecar(res, selftest);
@@ -539,10 +562,13 @@ static DWORD WaitForAnyStop(DWORD, DWORD ms) {
     return WAIT_TIMEOUT;
 }
 
-// Open a file read-only and return its size (0 if it does not exist).
+// Current size of a file (0 if it does not exist). Opens with attribute-only
+// access and full sharing so it works while another process (the imager) has
+// the file open for writing; a GENERIC_READ open would hit a sharing violation.
 static UINT64 GetFileBytes(const std::wstring& path) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return 0;
     LARGE_INTEGER sz = {0};
     BOOL ok = GetFileSizeEx(h, &sz);
@@ -550,24 +576,91 @@ static UINT64 GetFileBytes(const std::wstring& path) {
     return ok ? (UINT64)sz.QuadPart : 0;
 }
 
-// Compute the MD5 of an existing file into res->md5 (no-op if the file is missing).
-// Always hashes the whole file: the stop event is not checked here, because it
-// is already signaled when hashing a user-stopped (partial) image, and a hash
-// cut short would be recorded as if it covered the entire image.
+// Tell the UI which phase the worker is in (wParam = CapturePhase) and how
+// many bytes that phase expects in total (lParam, 0 = unknown).
+static void PostPhase(CapturePhase phase, UINT64 totalBytes) {
+    PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)phase, (LPARAM)totalBytes);
+}
+
+// Compute the MD5 of a completed image into res->md5 (no-op if the file is
+// missing). Only called for images that were not stopped mid-capture. If the
+// user presses Stop while hashing, the hash is abandoned (res->md5 stays empty,
+// res->hashStopped set) - a hash cut short must never be recorded.
 static void HashFile(CaptureResult* res) {
     HANDLE hf = CreateFileW(res->path.c_str(), GENERIC_READ,
                             FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hf == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz = {0};
+    GetFileSizeEx(hf, &sz);
+    UINT64 total = (UINT64)sz.QuadPart;
+    PostPhase(CapturePhase::Hashing, total);
+    PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, 0);
+
     MD5 md5;
     std::vector<BYTE> buf(4 * 1024 * 1024);
+    UINT64 done = 0, lastPosted = 0;
     for (;;) {
+        if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) {
+            res->hashStopped = true;
+            CloseHandle(hf);
+            return;
+        }
         DWORD rd = 0;
         if (!ReadFile(hf, buf.data(), (DWORD)buf.size(), &rd, nullptr) || rd == 0)
             break;
         md5.Update(buf.data(), rd);
+        done += rd;
+        if (done - lastPosted >= 64ull * 1024 * 1024) {  // ~every 64 MiB
+            lastPosted = done;
+            int pct = total ? (int)((double)done / (double)total * 100.0) : 0;
+            PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)(pct > 100 ? 100 : pct), (LPARAM)done);
+        }
     }
     res->md5 = md5.Hex();
     CloseHandle(hf);
+}
+
+// Two different WinPmem imagers ship under similar names, with different CLIs:
+//   Go imager (go-winpmem, 2023+):  go-winpmem acquire <out>   /  go-winpmem uninstall
+//   Classic C++ WinPmem (2.x):      winpmem <out>              /  winpmem -u
+// Passing the Go syntax to the classic imager makes it write the image to a
+// file literally named "acquire" (and "uninstall" starts a second capture),
+// so detect which one we have from its help text before running it.
+enum class ImagerKind { Go, Classic };
+
+static ImagerKind DetectImagerKind(const std::wstring& imager, const std::wstring& dir) {
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 64 * 1024)) return ImagerKind::Go;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    std::wstring cmd = L"\"" + imager + L"\" --help";
+    std::vector<wchar_t> cb(cmd.begin(), cmd.end()); cb.push_back(L'\0');
+    STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+    BOOL started = CreateProcessW(imager.c_str(), cb.data(), nullptr, nullptr, TRUE,
+                                  CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi);
+    CloseHandle(wr);  // our copy; ReadFile sees EOF once the child exits
+    std::string out;
+    if (started) {
+        if (WaitForSingleObject(pi.hProcess, 5000) != WAIT_OBJECT_0)
+            TerminateProcess(pi.hProcess, 1);
+        char b[4096];
+        DWORD n = 0;
+        while (ReadFile(rd, b, sizeof(b), &n, nullptr) && n > 0)
+            out.append(b, n);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    CloseHandle(rd);
+    // Classic WinPmem's usage lists single-letter options such as
+    // "-l    Load the driver and exit."; the Go imager has subcommands instead.
+    return (out.find("Load the driver and exit") != std::string::npos)
+               ? ImagerKind::Classic : ImagerKind::Go;
 }
 
 // Run the WinPmem imager to produce res->path, then hash + write meta.
@@ -590,8 +683,12 @@ static void RunDriverCapture(CaptureResult* res) {
     size_t sl = imager.find_last_of(L"\\/");
     std::wstring imagerDir = (sl == std::wstring::npos) ? L"." : imager.substr(0, sl);
 
-    // Build command line:  "<imager>" acquire "<res->path>"
-    std::wstring cmdline = L"\"" + imager + L"\" acquire \"" + res->path + L"\"";
+    ImagerKind kind = DetectImagerKind(imager, imagerDir);
+    std::wstring kindName = (kind == ImagerKind::Go) ? L"go-winpmem" : L"WinPmem 2.x";
+    std::wstring cmdline = (kind == ImagerKind::Go)
+        ? L"\"" + imager + L"\" acquire \"" + res->path + L"\""
+        : L"\"" + imager + L"\" \"" + res->path + L"\"";
+    std::wstring unloadArgs = (kind == ImagerKind::Go) ? L" uninstall" : L" -u";
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
@@ -624,6 +721,11 @@ static void RunDriverCapture(CaptureResult* res) {
         return;
     }
 
+    // The image is expected to be about the size of installed RAM. WinPmem pads
+    // gaps in the physical address space, so the file can end up somewhat
+    // larger; the bar is held at 99% until the imager actually exits.
+    UINT64 expected = (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0);
+    PostPhase(CapturePhase::Capturing, expected);
     PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)0, 0);
 
     // Monitor the imager. WinPmem writes progress to a console we hid; instead we
@@ -641,16 +743,13 @@ static void RunDriverCapture(CaptureResult* res) {
             break; // imager finished (success or error)
         // reflect growth as progress
         UINT64 fsz = GetFileBytes(res->path);
-        if (fsz > 0) {
+        if (fsz > 0 && fsz != lastBytes) {
+            lastBytes = fsz;
             res->bytesWritten = fsz;
             res->pagesWritten = fsz / 4096;
-            UINT64 needed = (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0);
-            int pct = needed ? (int)((double)fsz / (double)needed * 100.0) : 0;
-            if (pct > 100) pct = 100;
-            if (fsz != lastBytes) {
-                lastBytes = fsz;
-                PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0);
-            }
+            int pct = expected ? (int)((double)fsz / (double)expected * 100.0) : 0;
+            if (pct > 99) pct = 99;
+            PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)pct, (LPARAM)fsz);
         }
     }
 
@@ -660,9 +759,10 @@ static void RunDriverCapture(CaptureResult* res) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    // WinPmem always uninstalls its service when it exits; belt-and-suspenders.
+    // WinPmem unloads its driver when it exits normally; belt-and-suspenders
+    // (and required after a Stop, since TerminateProcess skips its cleanup).
     {
-        std::wstring uninstCmd = L"\"" + imager + L"\" uninstall";
+        std::wstring uninstCmd = L"\"" + imager + L"\"" + unloadArgs;
         std::vector<wchar_t> ub(uninstCmd.begin(), uninstCmd.end()); ub.push_back(L'\0');
         STARTUPINFOW si2; ZeroMemory(&si2, sizeof(si2)); si2.cb = sizeof(si2);
         si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
@@ -679,11 +779,9 @@ static void RunDriverCapture(CaptureResult* res) {
         res->bytesWritten = GetFileBytes(res->path);
         res->pagesWritten = res->bytesWritten / 4096;
         res->ok = (res->bytesWritten > 0);
-        res->method = L"WinPmem kernel driver (Velocidex) - stopped by user";
-        if (res->ok) {
-            HashFile(res);                 // MD5 over the partial image
-            WriteMetaSidecar(res, false);  // sidecar notes the user stop
-        }
+        res->method = L"WinPmem kernel driver (" + kindName + L") - stopped by user";
+        if (res->ok)
+            WriteMetaSidecar(res, false);  // no MD5 for a partial image; sidecar notes the stop
         return;
     }
 
@@ -694,7 +792,7 @@ static void RunDriverCapture(CaptureResult* res) {
         res->error =
             L"WinPmem imager finished without producing an image (exit code " +
             std::to_wstring(exitCode) + L").\n\n"
-            L"Imager: " + imager + L"\n\n"
+            L"Imager: " + imager + L" (" + kindName + L")\n\n"
             L"Common causes: not running as Administrator, or the OS blocked the "
             L"signed driver. Check Windows Event Viewer for a driver-load failure.";
         return;
@@ -704,13 +802,14 @@ static void RunDriverCapture(CaptureResult* res) {
     res->pagesWritten = produced / 4096;
     res->ok = true;
     if (exitCode == 0) {
-        res->method = L"WinPmem kernel driver (Velocidex signed driver)";
+        res->method = L"WinPmem kernel driver (" + kindName + L", Velocidex signed driver)";
     } else {
         // An image was written but the imager reported an error: keep it, but
         // flag it (dialog + .meta) as possibly incomplete.
         res->errCode = (UINT)exitCode;
-        res->method = L"WinPmem kernel driver (Velocidex signed driver) - imager exit code " +
-                      std::to_wstring(exitCode) + L", image may be incomplete";
+        res->method = L"WinPmem kernel driver (" + kindName + L", Velocidex signed driver) - "
+                      L"imager exit code " + std::to_wstring(exitCode) +
+                      L", image may be incomplete";
     }
 
     // MD5 over the whole image + .meta sidecar (same documentation as driverless).
@@ -1298,6 +1397,8 @@ static void OnCapture() {
 
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_capturing = true;
+    g_phase = CapturePhase::Capturing;
+    g_phaseTotal = 0;
     SetBusy(true);
     SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
     SendMessageW(g_progress, PBM_SETPOS, 0, 0);
@@ -1350,15 +1451,16 @@ static void OnCaptureFinished() {
 
     if (r->ok) {
         double mbps = (r->bytesWritten / 1024.0 / 1024.0) / (r->seconds > 0.0 ? r->seconds : 1.0);
-        std::wstring msg = (r->cancelled ? L"Capture stopped by user (partial image).\n\n"
-                                         : (g_selftest ? L"Self-test complete (synthetic data).\n\n"
-                                                       : L"Capture complete.\n\n"));
+        std::wstring msg = (r->cancelled ? L"Capture stopped by user (partial image, MD5 not computed).\n\n"
+                            : r->hashStopped ? L"Capture complete. MD5 skipped (stopped by user during hashing).\n\n"
+                            : (g_selftest ? L"Self-test complete (synthetic data).\n\n"
+                                          : L"Capture complete.\n\n"));
         msg += L"Image:  " + r->path + L"\n";
         msg += L"Size:   " + std::to_wstring(r->bytesWritten / (1024 * 1024)) +
                L" MB  (" + std::to_wstring(r->pagesWritten) + L" pages)\n";
         msg += L"Time:   " + FormatDuration(r->seconds) + L"\n";
         msg += L"Speed:  " + std::to_wstring((int)mbps) + L" MB/s\n";
-        msg += L"MD5:    " + Utf8ToWide(r->md5) + L"\n";
+        msg += L"MD5:    " + Md5Text(r) + L"\n";
         if (!r->method.empty())
             msg += L"Method: " + r->method + L"\n";
         if (!r->metaPath.empty())
@@ -1587,10 +1689,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // and the window would follow the mouse on the next move.
         g_dragging = false;
         return 0;
-    case WM_APP_PROGRESS:
-        SendMessageW(g_progress, PBM_SETPOS, (WPARAM)wp, 0);
-        InvalidateRect(hwnd, nullptr, FALSE); // repaint percent text
+    case WM_APP_PHASE:
+        g_phase = (CapturePhase)wp;
+        g_phaseTotal = (UINT64)lp;
         return 0;
+    case WM_APP_PROGRESS: {
+        SendMessageW(g_progress, PBM_SETPOS, (WPARAM)wp, 0);
+        // Status line: what is happening plus "<done> of <total>". Ignore late
+        // progress after Stop was pressed so "Stopping capture..." stays visible.
+        UINT64 done = (UINT64)lp;
+        bool stopping = g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0;
+        if (g_capturing && !stopping) {
+            std::wstring s;
+            if (g_phase == CapturePhase::Hashing)
+                s = L"Computing MD5...";
+            else if (g_selftest)
+                s = L"Running self-test (synthetic source)...";
+            else if (g_driverMode)
+                s = L"Capturing via WinPmem driver...";
+            else
+                s = L"Capturing physical memory...";
+            if (done > 0) {
+                s += L"  " + FormatGB(done);
+                if (g_phaseTotal > 0)
+                    s += (g_phase == CapturePhase::Capturing && g_driverMode ? L" of ~" : L" of ") +
+                         FormatGB(g_phaseTotal);
+            }
+            UpdateStatus(s, C.accent);
+        } else {
+            InvalidateRect(hwnd, nullptr, FALSE); // repaint percent text
+        }
+        return 0;
+    }
     case WM_APP_FINISHED:
         OnCaptureFinished();
         return 0;

@@ -42,7 +42,8 @@ integrity) is written to both the completion dialog and the `.meta` sidecar.
 - **Runs as Administrator** (required to read physical memory).
 - **Progress + Stop.** Live progress bar; the **Close** button becomes **Stop**
   during a capture, letting you cancel cleanly (a partial image + sidecar is
-  kept and marked as such).
+  kept and marked as such). No MD5 is computed for a stopped capture, and
+  pressing Stop during the MD5 step keeps the complete image but skips the hash.
 - **Pre-flight checks.** Warns on an existing destination (overwrite prompt)
   and verifies enough free disk space before starting.
 - **Modern UI.** Themed (Common Controls v6), per-monitor DPI aware, owner-drawn
@@ -106,7 +107,11 @@ memory. The `.meta` sidecar is clearly marked `SELF-TEST synthetic source`.
 kernel code, so the supported method is the signed WinPmem driver. During a
 capture the imager creates a temporary `winpmem` service, loads the driver,
 writes the image, and removes the service again. RAMstain also runs the
-imager's `uninstall` command afterwards as a safety net. Security products or
+imager's unload command afterwards as a safety net. Both the Go imager
+(`go-winpmem`, `acquire <file>`) and the classic C++ WinPmem 2.x
+(`winpmem <file>`) are supported. RAMstain reads the imager's `--help` output
+to tell them apart and passes the matching arguments. Progress is shown as the
+image file grows, followed by a progress readout while the MD5 is computed. Security products or
 driver-blocking policies (e.g. HVCI / the vulnerable-driver blocklist) can
 prevent the driver from loading; check Event Viewer if a capture produces no
 image.
