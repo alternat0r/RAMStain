@@ -46,7 +46,9 @@ forensic analysts time and avoid mistakes, not to replace WinPmem.
 
 Run `RAMstain.exe` (it asks for Administrator rights), choose the output path,
 and click **Capture**. When it finishes you get a summary with size, time,
-speed and SHA-256.
+speed and SHA-256. **Copy hashes** puts the SHA-256 of every file from the run
+on the clipboard in `sha256sum` format (`<hash>  <file name>`), ready to paste
+into case notes or to check later with `sha256sum -c` in the output folder.
 
 ### Keyboard
 
@@ -144,7 +146,7 @@ Linux/macOS `cat` command.
 ## Collecting the pagefile, hibernation file and swapfile
 
 Tick **Pagefile**, **Hibernation file** and/or **Swapfile** in the **Collect**
-row (or pass `--pagefile` / `--hiberfil` / `--swapfile` / `--system-files`) to
+group (or pass `--pagefile` / `--hiberfil` / `--swapfile` / `--system-files`) to
 copy `pagefile.sys`, `hiberfil.sys` and `swapfile.sys` (the swap file for
 Store apps) to the same folder as the memory image, right after the capture.
 Each copy's size, path and SHA-256 are shown when it finishes and recorded in

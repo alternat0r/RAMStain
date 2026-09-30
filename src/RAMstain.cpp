@@ -88,6 +88,7 @@
 #define IDC_SUB_PRIMARY  2002
 #define IDC_SUB_SECOND   2003
 #define IDC_SUB_OK       2004
+#define IDC_SUB_COPY     2005
 
 // System-menu command (title-bar icon menu). Must be below 0xF000 with the low
 // four bits clear, as Windows uses those bits in WM_SYSCOMMAND.
@@ -148,12 +149,12 @@ static HFONT  g_fFoot = nullptr;  // header subtitle / footer text
 
 // Main window layout, in 96-dpi pixels (scaled with Sc()). Client area is
 // kDesignW x kDesignH; see DrawMain and WM_CREATE for the rows.
-static const int kDesignW = 520, kDesignH = 346;
+static const int kDesignW = 520, kDesignH = 376;
 static const int kPad     = 16;   // outer margin
 static const int kHeaderH = 48;   // dark header band
 static const int kCol2    = 268;  // x of the second column (Host/OS, driver checkbox)
 static const int kBrowseW = 80;   // Browse button width
-static const int kFooterY = 318;  // top of the footer strip
+static const int kFooterY = 348;  // top of the footer strip
 static HICON  g_hIcon = nullptr;
 static HICON  g_hIconAbout = nullptr;   // larger icon for the About dialog (loaded on first use)
 
@@ -2228,6 +2229,7 @@ struct SubSpec {
     std::wstring secondBtn;    // left button (empty = none)
     std::wstring openDir;      // if non-empty, second button opens this folder
     int         w, h;
+    std::wstring copyText;     // if non-empty, a "Copy hashes" button (left) copies it
 };
 static SubSpec g_subSpec;
 static HWND    g_subHwnd = nullptr;
@@ -2343,6 +2345,10 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int by = H - Sc(52, dpi);
         int bh = Sc(32, dpi);
         int pw = Sc(150, dpi), sw = Sc(120, dpi);
+        // Left-aligned, created first so Tab runs left to right.
+        if (!g_subSpec.copyText.empty())
+            MakeButton(hwnd, L"Copy &hashes", Sc(16, dpi), by, sw, bh,
+                       BtnStyle::Secondary, (HMENU)IDC_SUB_COPY, g_fSmall, dpi);
         HWND b1 = MakeButton(hwnd, g_subSpec.primaryBtn.c_str(),
                              W - Sc(16, dpi) - pw, by, pw, bh,
                              BtnStyle::Primary, (HMENU)IDC_SUB_PRIMARY, g_fBody, dpi);
@@ -2409,6 +2415,25 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_subResult = 1;
             CloseSubWindow(hwnd);
             return 0;
+        case IDC_SUB_COPY: {
+            // Copy the hash list; the dialog stays open. The label confirms it.
+            bool ok = false;
+            if (OpenClipboard(hwnd)) {
+                EmptyClipboard();
+                size_t cb = (g_subSpec.copyText.size() + 1) * sizeof(wchar_t);
+                if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, cb)) {
+                    memcpy(GlobalLock(g), g_subSpec.copyText.c_str(), cb);
+                    GlobalUnlock(g);
+                    ok = SetClipboardData(CF_UNICODETEXT, g) != nullptr;
+                    if (!ok) GlobalFree(g);
+                }
+                CloseClipboard();
+            }
+            HWND b = (HWND)lp;
+            SetWindowTextW(b, ok ? L"Copied" : L"Copy failed");
+            InvalidateRect(b, nullptr, FALSE);
+            return 0;
+        }
         case IDC_SUB_SECOND:
             g_subResult = 2;
             if (!g_subSpec.openDir.empty())
@@ -2477,7 +2502,8 @@ static void NormalizeNewlines(std::wstring& s) {
 // Returns 1 if the primary button was pressed, 2 if the secondary.
 static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bodyIn,
                          const std::wstring& primaryBtn, const std::wstring& secondBtn,
-                         const std::wstring& openDir, int w, int h) {
+                         const std::wstring& openDir, int w, int h,
+                         const std::wstring& copyText = std::wstring()) {
     std::wstring body = bodyIn;
     NormalizeNewlines(body);
     // w/h are client sizes in 96-dpi units (like all layout values); scale them
@@ -2485,7 +2511,8 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
     int dpi = g_hwnd ? (int)GetDpiForWindow(g_hwnd) : (int)GetDpiForSystem();
     w = Sc(w, dpi);
     h = Sc(h, dpi);
-    g_subSpec = SubSpec{kind, std::wstring(title), body, primaryBtn, secondBtn, openDir, w, h};
+    g_subSpec = SubSpec{kind, std::wstring(title), body, primaryBtn, secondBtn, openDir, w, h, copyText};
+    NormalizeNewlines(g_subSpec.copyText);
     g_subResult = 1;
     HINSTANCE hInst = GetModuleHandleW(nullptr);
     g_subHwnd = CreateWindowExW(0, kSubClass, title,
@@ -2702,16 +2729,19 @@ static void DrawMain(HDC dc, HWND hwnd) {
 
     hline(S(154));
 
-    // Options rows: the "Split" label (g_lblSplit), combo and driver checkbox
-    // (y 164..188), then the "Also" label and pagefile / hibernation checkboxes
-    // (y 192..216) are all child controls.
+    // Options row (y 164..188): the "Split" label (g_lblSplit), combo and
+    // driver checkbox are child controls.
+
+    // Collect group: "COLLECT" caption (g_lblCollect) over a white rounded
+    // panel (y 214..246) holding the four checkboxes (child controls).
+    DrawRoundRect(dc, { S(kPad), S(214), W - S(kPad), S(246) }, S(6), g_brWhite, g_penEditBorder);
 
     // Progress percentage (the bar itself is a child control) and status line.
     int pr = g_progress ? (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0) : 0;
-    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(226), W - S(kPad), S(244) },
+    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(256), W - S(kPad), S(274) },
          g_fBody, C.text, DT_RIGHT | DT_VCENTER);
     if (!g_status.empty())
-        text(g_status, { S(kPad), S(246), W - S(kPad), S(264) }, g_fSmall, g_statusColor,
+        text(g_status, { S(kPad), S(276), W - S(kPad), S(294) }, g_fSmall, g_statusColor,
              DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
     // Footer strip: slightly darker band with a top border; links are child
@@ -3066,6 +3096,23 @@ static std::wstring SysFileSummary(const CaptureResult* r, const wchar_t* headin
     return s;
 }
 
+// SHA-256 of every file this run produced, one "<hash>  <file name>" line
+// each (sha256sum format, so `sha256sum -c` checks them in the output
+// folder). Empty when nothing was hashed.
+static std::wstring HashList(const CaptureResult* r) {
+    auto name = [](const std::wstring& p) { return p.substr(p.find_last_of(L"\\/") + 1); };
+    std::wstring s;
+    if (!r->sha256.empty())
+        s += Utf8ToWide(r->sha256) + L"  " + name(r->path) + L"\n";
+    for (const SplitPart& part : r->parts)
+        if (!part.sha256.empty())
+            s += Utf8ToWide(part.sha256) + L"  " + name(part.path) + L"\n";
+    for (const SysFileCapture& f : r->sysfiles)
+        if (!f.path.empty() && !f.sha256.empty())
+            s += Utf8ToWide(f.sha256) + L"  " + name(f.path) + L"\n";
+    return s;
+}
+
 // True when at least one requested system file was actually copied to disk.
 static bool HasCollectedSysFile(const CaptureResult* r) {
     for (const SysFileCapture& f : r->sysfiles)
@@ -3099,7 +3146,8 @@ static void OnCaptureFinished() {
                       SysFileSummary(r, L"System files (no memory image requested):") +
                       L"\nTime:   " + FormatDuration(r->seconds) + L"\n"
                       L"\nStored locally. No data was transmitted anywhere.",
-                      L"Close", any ? L"Open folder" : L"", any ? dir : L"", 560, 320);
+                      L"Close", any ? L"Open folder" : L"", any ? dir : L"", 560, 320,
+                      HashList(r));
         return;
     }
 
@@ -3138,7 +3186,7 @@ static void OnCaptureFinished() {
         if (sl != std::wstring::npos) dir = dir.substr(0, sl);
         ShowSubWindow(1,
                       (r->cancelled ? L"Capture stopped" : L"Capture complete"),
-                      msg, L"Close", L"Open folder", dir, 560, 380);
+                      msg, L"Close", L"Open folder", dir, 560, 380, HashList(r));
         UpdateStatus(L"Done - " + std::to_wstring(r->bytesWritten / (1024 * 1024)) +
                      L" MB written.", C.ok);
     } else {
@@ -3154,7 +3202,7 @@ static void OnCaptureFinished() {
                           SysFileSummary(r, L"Collected:") +
                           L"\nThe memory image was not captured:\n" +
                           (r->error.empty() ? L"Memory capture failed." : r->error),
-                          L"Close", L"Open folder", dir, 560, 380);
+                          L"Close", L"Open folder", dir, 560, 380, HashList(r));
             return;
         }
         UpdateStatus(L"Capture failed.", C.danger);
@@ -3399,70 +3447,58 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_chkDriver, BM_SETCHECK,
                      (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        // Collect row (y 192..216): "Collect" label, then the memory image
-        // (under the drop-down), pagefile, hibernation file (under the driver
-        // checkbox) and swapfile. Unticking Memory image collects only the
-        // system files. The checkboxes carry their own access keys (Alt+M,
-        // Alt+P, Alt+H, Alt+W); the label is decorative.
-        g_lblCollect = CreateWindowExW(0, L"STATIC", L"Collect",
+        // Collect group: "COLLECT" caption (y 198, like "SAVE TO") over a white
+        // panel drawn in DrawMain (y 214..246) with four checkboxes on a 120px
+        // grid - Hibernation lines up with the driver checkbox (kCol2).
+        // Unticking Memory image collects only the system files. The
+        // checkboxes carry their own access keys (Alt+M, Alt+P, Alt+H, Alt+W);
+        // the caption is decorative.
+        g_lblCollect = CreateWindowExW(0, L"STATIC", L"COLLECT",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
-                                       S(kPad), S(192), S(38), S(24),
+                                       S(kPad), S(198), S(200), S(14),
                                        hwnd, nullptr, hInst, nullptr);
-        SendMessageW(g_lblCollect, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        g_chkMemory = CreateWindowExW(0, L"BUTTON", L"&Memory image",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                      S(kPad + 40), S(193), S(100), S(22),
-                                      hwnd, (HMENU)IDC_CHK_MEMORY, hInst, nullptr);
-        SendMessageW(g_chkMemory, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        SendMessageW(g_chkMemory, BM_SETCHECK,
-                     (g_cliNoMemory && !g_selftest) ? BST_UNCHECKED : BST_CHECKED, 0);
-        g_chkPagefile = CreateWindowExW(0, L"BUTTON", L"&Pagefile",
-                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                        S(kPad + 148), S(193), S(kCol2 - 8 - kPad - 148), S(22),
-                                        hwnd, (HMENU)IDC_CHK_PAGEFILE, hInst, nullptr);
-        SendMessageW(g_chkPagefile, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        SendMessageW(g_chkPagefile, BM_SETCHECK,
-                     (g_cliCollectPagefile && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
-        g_chkHiberfil = CreateWindowExW(0, L"BUTTON", L"&Hibernation file",
-                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                        S(kCol2), S(193), S(104), S(22),
-                                        hwnd, (HMENU)IDC_CHK_HIBERFIL, hInst, nullptr);
-        SendMessageW(g_chkHiberfil, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        SendMessageW(g_chkHiberfil, BM_SETCHECK,
-                     (g_cliCollectHiberfil && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
-        g_chkSwapfile = CreateWindowExW(0, L"BUTTON", L"S&wapfile",
-                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                        S(kCol2 + 112), S(193), S(W - kPad - kCol2 - 112), S(22),
-                                        hwnd, (HMENU)IDC_CHK_SWAPFILE, hInst, nullptr);
-        SendMessageW(g_chkSwapfile, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        SendMessageW(g_chkSwapfile, BM_SETCHECK,
-                     (g_cliCollectSwapfile && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(g_lblCollect, WM_SETFONT, (WPARAM)g_fLabel, TRUE);
+        struct { HWND* h; const wchar_t* text; int id; bool on; } kCollect[] = {
+            { &g_chkMemory,   L"&Memory image",    IDC_CHK_MEMORY,   !(g_cliNoMemory && !g_selftest) },
+            { &g_chkPagefile, L"&Pagefile",        IDC_CHK_PAGEFILE, g_cliCollectPagefile && !g_selftest },
+            { &g_chkHiberfil, L"&Hibernation file", IDC_CHK_HIBERFIL, g_cliCollectHiberfil && !g_selftest },
+            { &g_chkSwapfile, L"S&wapfile",        IDC_CHK_SWAPFILE, g_cliCollectSwapfile && !g_selftest },
+        };
+        for (int c = 0; c < 4; ++c) {
+            HWND h = CreateWindowExW(0, L"BUTTON", kCollect[c].text,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
+                                     S(kPad + 12 + 120 * c), S(219), S(c < 3 ? 112 : 104), S(22),
+                                     hwnd, (HMENU)(INT_PTR)kCollect[c].id, hInst, nullptr);
+            SendMessageW(h, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+            SendMessageW(h, BM_SETCHECK, kCollect[c].on ? BST_CHECKED : BST_UNCHECKED, 0);
+            *kCollect[c].h = h;
+        }
         EnableWindow(g_chkMemory, !g_selftest);
         UpdateMemoryOptions(false);
 
-        // Progress bar (y 232, 6px), percentage drawn to its right in DrawMain.
+        // Progress bar (y 262, 6px), percentage drawn to its right in DrawMain.
         g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
                                      WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
-                                     S(kPad), S(232), S(W - 2 * kPad - 52), S(6),
+                                     S(kPad), S(262), S(W - 2 * kPad - 52), S(6),
                                      hwnd, (HMENU)IDC_PROGRESS, hInst, nullptr);
         SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
 
-        // Action row (y 274..306): "Always on top" left, Capture + Close right.
+        // Action row (y 304..336): "Always on top" left, Capture + Close right.
         g_chkTop = CreateWindowExW(0, L"BUTTON", L"&Always on top",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                   S(kPad), S(280), S(130), S(20),
+                                   S(kPad), S(310), S(130), S(20),
                                    hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
         // Capture before Close so Tab goes left to right.
-        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(274), S(104), S(32),
+        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(304), S(104), S(32),
                                   BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
-        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(274), S(84), S(32),
+        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(304), S(84), S(32),
                                 BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
 
-        // Footer links (y 318..346 strip).
+        // Footer links (y 348..376 strip).
         g_btnDisc = MakeButton(hwnd, L"D&isclaimer", S(12), S(kFooterY + 4), S(70), S(20),
                                BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fFoot, dpi);
         g_btnPriv = MakeButton(hwnd, L"Pri&vacy Policy", S(84), S(kFooterY + 4), S(88), S(20),
@@ -3510,16 +3546,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_CTLCOLORSTATIC:
         // Checkboxes and labels sit on the grey body background, not on white boxes.
-        if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver ||
-            (HWND)lp == g_chkMemory || (HWND)lp == g_chkPagefile || (HWND)lp == g_chkHiberfil ||
-            (HWND)lp == g_chkSwapfile) {
+        if ((HWND)lp == g_chkMemory || (HWND)lp == g_chkPagefile ||
+            (HWND)lp == g_chkHiberfil || (HWND)lp == g_chkSwapfile) {
+            SetBkColor((HDC)wp, C.white);            // inside the Collect panel
+            SetTextColor((HDC)wp, C.secText);
+            return (LRESULT)g_brWhite;
+        }
+        if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver) {
             SetBkColor((HDC)wp, C.bg);
             SetTextColor((HDC)wp, C.secText);
             return (LRESULT)g_brBg;
         }
         if ((HWND)lp == g_lblSave || (HWND)lp == g_lblSplit || (HWND)lp == g_lblCollect) {
             SetBkColor((HDC)wp, C.bg);
-            SetTextColor((HDC)wp, (HWND)lp == g_lblSave ? C.label : C.muted);
+            SetTextColor((HDC)wp, ((HWND)lp == g_lblSave || (HWND)lp == g_lblCollect) ? C.label : C.muted);
             return (LRESULT)g_brBg;
         }
         [[fallthrough]];
