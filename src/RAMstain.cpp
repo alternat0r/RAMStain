@@ -191,6 +191,8 @@ struct CaptureResult {
     UINT64    bytesWritten = 0;
     double    seconds = 0.0;
     std::wstring error;              // user-facing (empty on success)
+    FILETIME     startUtc = {};      // capture start (UTC)
+    FILETIME     endUtc = {};        // image data complete, before hashing/splitting (UTC)
     std::string  md5;                // whole image; empty when not computed
     std::string  sha256;
     std::wstring path;
@@ -418,6 +420,32 @@ static void FillSynthetic(BYTE* buf, size_t n, UINT64 off) {
         buf[i] = (BYTE)((off + i) ^ ((off + i) >> 8) ^ ((off + i) >> 16));
 }
 
+// "2026-09-30T07:21:14Z  (local 2026-09-30 15:21:14 UTC+08:00)": ISO 8601 UTC,
+// plus local time with the UTC offset in effect at that moment (DST-aware).
+static std::wstring FormatUtcAndLocal(FILETIME ft) {
+    if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0) GetSystemTimeAsFileTime(&ft);
+    SYSTEMTIME u, l;
+    FileTimeToSystemTime(&ft, &u);
+    if (!SystemTimeToTzSpecificLocalTime(nullptr, &u, &l)) l = u;
+    FILETIME lf;
+    SystemTimeToFileTime(&l, &lf);
+    ULARGE_INTEGER a, b;
+    a.LowPart = ft.dwLowDateTime; a.HighPart = ft.dwHighDateTime;
+    b.LowPart = lf.dwLowDateTime; b.HighPart = lf.dwHighDateTime;
+    // Round to whole minutes: SYSTEMTIME drops sub-millisecond ticks, so the raw
+    // difference is a hair short of the real offset (e.g. 7:59:59.9999).
+    long long diff = (long long)b.QuadPart - (long long)a.QuadPart;   // 100 ns units
+    long long offMin = (diff + (diff >= 0 ? 300000000LL : -300000000LL)) / 600000000LL;
+    long long absMin = offMin < 0 ? -offMin : offMin;
+    wchar_t buf[96];
+    _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+                 L"%04u-%02u-%02uT%02u:%02u:%02uZ  (local %04u-%02u-%02u %02u:%02u:%02u UTC%c%02lld:%02lld)",
+                 u.wYear, u.wMonth, u.wDay, u.wHour, u.wMinute, u.wSecond,
+                 l.wYear, l.wMonth, l.wDay, l.wHour, l.wMinute, l.wSecond,
+                 offMin < 0 ? L'-' : L'+', absMin / 60, absMin % 60);
+    return buf;
+}
+
 // A whole-image hash (res->md5 / res->sha256) as shown in the .meta sidecar
 // and the completion dialog.
 static std::wstring HashText(const CaptureResult* res, const std::string& hash) {
@@ -433,7 +461,6 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
     std::wstring hostName  = GetComputerName();
     std::wstring osVersion = GetOsVersionString();
     std::wstring kernelVer = GetKernelVersionString();
-    std::wstring capTime   = MakeTimestamp();
 
     std::wstring metaPath = res->path;
     StripExtensionInPlace(metaPath);
@@ -479,7 +506,8 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
         L"Host:        " + hostName + L"\n" +
         L"OS:          " + osVersion + L"\n" +
         L"Kernel:      " + kernelVer + L"\n" +
-        L"Captured:    " + capTime + L" (local time)\n" +
+        L"Started:     " + FormatUtcAndLocal(res->startUtc) + L"\n" +
+        L"Finished:    " + FormatUtcAndLocal(res->endUtc) + L"\n" +
         L"Size:        " + std::to_wstring(res->bytesWritten) + L" bytes\n" +
         L"Pages:       " + std::to_wstring(res->pagesWritten) + L" x 4096 bytes\n" +
         L"MD5:         " + HashText(res, res->md5) + L"\n" +
@@ -752,6 +780,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
         if (offset >= neededBytes) break;
     }
 
+    GetSystemTimeAsFileTime(&res->endUtc);   // image data complete
     cleanup();
 
     if (aborted) return;
@@ -1161,6 +1190,7 @@ static void RunDriverCapture(CaptureResult* res) {
         }
     }
 
+    GetSystemTimeAsFileTime(&res->endUtc);   // imager done (or stopped): image data complete
     DWORD exitCode = STILL_ACTIVE;
     WaitForSingleObject(pi.hProcess, 5000);
     GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -1229,6 +1259,7 @@ static void RunDriverCapture(CaptureResult* res) {
 static DWORD WINAPI CaptureThreadProc(LPVOID arg) {
     CaptureResult* res = (CaptureResult*)arg;
     LARGE_INTEGER t0, t1, qf;
+    GetSystemTimeAsFileTime(&res->startUtc);
     QueryPerformanceCounter(&t0);
     double msPerTick = 0.0;
     if (QueryPerformanceFrequency(&qf) && qf.QuadPart > 0)
@@ -1651,6 +1682,11 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
                          const std::wstring& openDir, int w, int h) {
     std::wstring body = bodyIn;
     NormalizeNewlines(body);
+    // w/h are client sizes in 96-dpi units (like all layout values); scale them
+    // to the main window's DPI so the dialog grows with its Sc()-scaled contents.
+    int dpi = g_hwnd ? (int)GetDpiForWindow(g_hwnd) : (int)GetDpiForSystem();
+    w = Sc(w, dpi);
+    h = Sc(h, dpi);
     g_subSpec = SubSpec{kind, std::wstring(title), body, primaryBtn, secondBtn, openDir, w, h};
     g_subResult = 1;
     HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -1696,9 +1732,7 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
 
 // About dialog, opened from the title-bar icon (system) menu.
 static void ShowAbout() {
-    int dpi = g_hwnd ? GetDpiForWindow(g_hwnd) : 96;
-    ShowSubWindow(kSubAbout, L"About RAMstain", L"", L"Close", L"", L"",
-                  Sc(440, dpi), Sc(316, dpi));
+    ShowSubWindow(kSubAbout, L"About RAMstain", L"", L"Close", L"", L"", 440, 316);
 }
 
 // ---------------------------------------------------------------------------
@@ -2167,7 +2201,7 @@ static std::wstring ThirdPartyNotice() {
         L"<scudette@gmail.com>, distributed by Velocidex "
         L"(https://github.com/Velocidex/WinPmem). WinPmem is licensed under the "
         L"Apache License, Version 2.0, reproduced below. It is not covered by "
-        L"sections 5 and 6 of these Terms; its own license applies to it.\n"
+        L"RAMstain's MIT License or these Terms; its own license applies to it.\n"
         L"\n";
     HRSRC hr = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_WINPMEM_LICENSE), RT_RCDATA);
     HGLOBAL hg = hr ? LoadResource(nullptr, hr) : nullptr;

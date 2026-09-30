@@ -63,7 +63,7 @@ variable. Both the classic WinPmem 2.x and the Go imager (`go-winpmem`) work.
 | File | Contents |
 |------|----------|
 | `<name>.raw` | Physical memory image. With splitting: `<name>.001`, `<name>.002`, … |
-| `<name>.meta` | Image path, host, OS/kernel, capture time, size, MD5, SHA-256, tool version, method, and per-part hashes when split. |
+| `<name>.meta` | Image path, host, OS/kernel, capture start and finish (UTC and local), size, MD5, SHA-256, tool version, method, and per-part hashes when split. |
 
 Example `host1.meta`:
 
@@ -74,7 +74,8 @@ Image:       D:\evidence\host1.raw
 Host:        WS-FORENSICS-01
 OS:          Windows 10.0 build 26200
 Kernel:      NT 10.0.26200
-Captured:    20260928_163614 (local time)
+Started:     2026-09-28T08:36:14Z  (local 2026-09-28 16:36:14 UTC+08:00)
+Finished:    2026-09-28T08:42:51Z  (local 2026-09-28 16:42:51 UTC+08:00)
 Size:        34359738368 bytes
 Pages:       8388608 x 4096 bytes
 MD5:         2ea471360b0e7eecd12e9f61a5d2649c
@@ -179,7 +180,7 @@ the footer links) and kept in [`src/legal.h`](src/legal.h).
 ## License
 
 RAMstain is released under the [MIT License](LICENSE).
-Copyright (c) 2026 Kamil Alta.
+Copyright (c) 2026 RAMstain contributors.
 
 The embedded WinPmem imager is not covered by the MIT License; it remains
 under its own [Apache License 2.0](third_party/winpmem/LICENSE).

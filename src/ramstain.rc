@@ -23,7 +23,7 @@ BEGIN
             VALUE "FileDescription",  "RAMstain - Compact Physical Memory Capture"
             VALUE "FileVersion",      RAMSTAIN_VER_STR4
             VALUE "InternalName",     "RAMstain"
-            VALUE "LegalCopyright",   "RAMstain"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 RAMstain contributors. MIT License."
             VALUE "OriginalFilename", "RAMstain.exe"
             VALUE "ProductName",      "RAMstain"
             VALUE "ProductVersion",   RAMSTAIN_VER_STR4
