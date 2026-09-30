@@ -3880,6 +3880,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     ws.hInstance = hInstance;
     ws.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     ws.hbrBackground = g_brBg;
+    // Same title-bar icon as the main window (Disclaimer, About, results, ...).
+    ws.hIcon   = wc.hIcon;
+    ws.hIconSm = wc.hIconSm;
     ws.lpszClassName = kSubClass;
     if (!RegisterClassExW(&ws)) return 1;
 
