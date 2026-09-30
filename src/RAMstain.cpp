@@ -1642,6 +1642,12 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
             PostQuitMessage((int)m.wParam);
             break;
         }
+        // Esc closes the dialog, same as its X (treated as Cancel).
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE &&
+            (m.hwnd == self || IsChild(self, m.hwnd))) {
+            PostMessageW(self, WM_CLOSE, 0, 0);
+            continue;
+        }
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
@@ -2539,6 +2545,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
 
+    // Single instance, machine-wide ("Global\" covers other logon sessions too):
+    // two captures loading the WinPmem driver at once would conflict. The
+    // handle is kept open for the life of the process; Windows releases it on
+    // exit, including a crash.
+    HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, L"Global\\RAMstain.SingleInstance");
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // Bring the running copy (or its open dialog) to the front if it is in
+        // this session; otherwise it is in another session - just say so.
+        if (HWND other = FindWindowW(kWindowClass, nullptr)) {
+            if (IsIconic(other)) ShowWindow(other, SW_RESTORE);
+            SetForegroundWindow(GetLastActivePopup(other));
+        } else {
+            MessageBoxW(nullptr,
+                        L"RAMstain is already running (possibly in another user session).\n\n"
+                        L"Only one copy can run at a time.",
+                        L"RAMstain", MB_OK | MB_ICONINFORMATION);
+        }
+        CloseHandle(instanceMutex);
+        return 0;
+    }
+
     // Remove imager folders left in %TEMP% by RAMstain instances that crashed.
     SweepStaleDropDirs();
 
@@ -2606,6 +2633,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        // Esc anywhere in the main window = quit (IDCANCEL: warns first if a
+        // capture is running). A plain message loop never turns Esc into
+        // IDCANCEL by itself, so do it here. Leave Esc alone while the Split
+        // drop-down list is open - there it just closes the list.
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE &&
+            (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd)) &&
+            !SendMessageW(g_cmbSplit, CB_GETDROPPEDSTATE, 0, 0)) {
+            SendMessageW(g_hwnd, WM_COMMAND, IDCANCEL, 0);
+            continue;
+        }
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
