@@ -142,11 +142,14 @@ Tick **Pagefile** and/or **Hibernation file** in the **Also** row (or pass
 `--pagefile` / `--hiberfil` / `--system-files`) to copy `pagefile.sys` and
 `hiberfil.sys` to the same folder as the memory image, right after the capture.
 
-- No kernel driver is needed: these files are locked by the OS, but an
-  Administrator can read them with full sharing. RAMstain copies them in one
-  pass, computing SHA-256 at the same time.
-- The pagefile is located from the system's `PagefileList` setting (it may live
-  on any volume); the hibernation file from the system volume. If a file does
+- No kernel driver is needed. Windows keeps these files open with no sharing,
+  so even an Administrator cannot open them normally; RAMstain locates the
+  file's clusters in the NTFS master file table and reads them directly from
+  the volume, computing SHA-256 in the same pass. They are live files, so the
+  copy reflects their contents at the time each part is read. The volume must
+  be NTFS.
+- The pagefile is located from the system's `ExistingPageFiles` setting (it may
+  live on any volume); the hibernation file from the system volume. If a file does
   not exist — the pagefile or hibernation is disabled — the run notes it and
   writes a `.meta` sidecar recording that nothing was collected.
 - Collection is independent of the memory capture: a pagefile/hibernation file

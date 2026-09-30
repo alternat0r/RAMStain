@@ -35,6 +35,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <winioctl.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <commdlg.h>
@@ -44,6 +45,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include "sha256.h"
@@ -201,6 +203,7 @@ struct SysFileCapture {
     std::wstring path;               // the collected copy (empty if not collected)
     UINT64       bytes = 0;
     std::string  sha256;             // empty when no hash was computed
+    std::wstring method;             // how it was read (empty if never opened)
     FILETIME     startUtc = {};      // collection start (UTC)
     FILETIME     endUtc = {};        // collection end (UTC)
     std::wstring metaPath;           // <path>.meta sidecar (empty if not written)
@@ -278,13 +281,18 @@ private:
 class HashPipeline {
 public:
     HashPipeline(size_t blockBytes, UINT64 partSize) : m_parts(partSize) {
-        for (Slot& s : m_slot) s.buf.resize(blockBytes);
+        // Page-aligned (VirtualAlloc), as raw volume reads require.
+        for (Slot& s : m_slot)
+            s.buf = (BYTE*)VirtualAlloc(nullptr, blockBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         m_thread[0] = CreateThread(nullptr, 0, WholeThread, this, 0, nullptr);
         if (partSize)
             m_thread[1] = CreateThread(nullptr, 0, PartThread, this, 0, nullptr);
         m_consumers = (m_thread[0] ? 1 : 0) + (m_thread[1] ? 1 : 0);
     }
-    ~HashPipeline() { Join(true); }
+    ~HashPipeline() {
+        Join(true);
+        for (Slot& s : m_slot) if (s.buf) VirtualFree(s.buf, 0, MEM_RELEASE);
+    }
     HashPipeline(const HashPipeline&) = delete;
     HashPipeline& operator=(const HashPipeline&) = delete;
 
@@ -295,15 +303,15 @@ public:
         while (s.pending > 0)
             SleepConditionVariableSRW(&m_cv, &m_lock, INFINITE, 0);
         ReleaseSRWLockExclusive(&m_lock);
-        return s.buf.data();
+        return s.buf;
     }
 
     // Hand the first n bytes of the buffer from Acquire() to the hashers.
     void Submit(size_t n) {
         Slot& s = m_slot[m_submitted % kSlots];
         s.n = n;
-        if (!m_thread[0]) m_whole.Update(s.buf.data(), n);
-        if (m_parts.partSize && !m_thread[1]) m_parts.Update(s.buf.data(), n);
+        if (!m_thread[0]) m_whole.Update(s.buf, n);
+        if (m_parts.partSize && !m_thread[1]) m_parts.Update(s.buf, n);
         AcquireSRWLockExclusive(&m_lock);
         s.pending = m_consumers;
         ++m_submitted;
@@ -322,7 +330,7 @@ public:
 private:
     static const int kSlots = 4;
     struct Slot {
-        std::vector<BYTE> buf;
+        BYTE* buf = nullptr;
         size_t n = 0;
         int pending = 0;          // hasher threads still reading this buffer
     };
@@ -339,8 +347,8 @@ private:
             ReleaseSRWLockExclusive(&m_lock);
             if (!have) return;
             Slot& s = m_slot[next % kSlots];
-            if (parts) m_parts.Update(s.buf.data(), s.n);
-            else       m_whole.Update(s.buf.data(), s.n);
+            if (parts) m_parts.Update(s.buf, s.n);
+            else       m_whole.Update(s.buf, s.n);
             AcquireSRWLockExclusive(&m_lock);
             --s.pending;
             ReleaseSRWLockExclusive(&m_lock);
@@ -1126,11 +1134,19 @@ static DWORD WaitForAnyStop(DWORD, DWORD ms) {
 // Current size of a file (0 if it does not exist). Opens with attribute-only
 // access and full sharing so it works while another process (the imager) has
 // the file open for writing; a GENERIC_READ open would hit a sharing violation.
+// Files the kernel holds with no sharing at all (pagefile.sys, hiberfil.sys)
+// cannot be opened even like that, so fall back to the directory entry.
 static UINT64 GetFileBytes(const std::wstring& path) {
     HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (h == INVALID_HANDLE_VALUE) {
+        WIN32_FIND_DATAW fd;
+        HANDLE hf = FindFirstFileW(path.c_str(), &fd);
+        if (hf == INVALID_HANDLE_VALUE) return 0;
+        FindClose(hf);
+        return ((UINT64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    }
     LARGE_INTEGER sz = {0};
     BOOL ok = GetFileSizeEx(h, &sz);
     CloseHandle(h);
@@ -1191,10 +1207,11 @@ static void HashFile(CaptureResult* res) {
 // ---------------------------------------------------------------------------
 //  System file collection (pagefile.sys / hiberfil.sys)
 //
-//  These live on the system volume, are locked by the OS for the whole
-//  session, and can be read by an Administrator with generous share flags -
-//  no kernel driver is needed. Each one is copied in full to a file next to
-//  the memory image, hashing in a single pass. Independent of the memory
+//  These are held open by the kernel with no sharing for the whole session,
+//  so a normal open fails even for an Administrator; they are read raw from
+//  the NTFS volume instead (see MapLockedFile) - no kernel driver is needed.
+//  Each one is copied in full to a file next to the memory image, hashing in
+//  a single pass. Independent of the memory
 //  capture itself, so a pagefile/hibernation file is still collected even if
 //  the memory image fails (the .meta sidecar says so).
 // ---------------------------------------------------------------------------
@@ -1209,32 +1226,25 @@ static std::wstring GetSystemVolume() {
     return std::wstring(sysroot, 3);   // "C:\" + the backslash
 }
 
-// Full paths of every pagefile the system uses, from the registry
-// (HKLM\...\Session Manager\Memory Management\PagefileList), else none.
+// Full paths of every pagefile the system is using, from the registry
+// (HKLM\...\Session Manager\Memory Management\ExistingPageFiles, a
+// REG_MULTI_SZ of NT paths such as "\??\C:\pagefile.sys").
 static std::vector<std::wstring> GetPagefilePaths() {
     std::vector<std::wstring> out;
-    LSTATUS st = ERROR_SUCCESS;
-    char value[512] = {0};
-    DWORD cb = sizeof(value);
-    st = RegQueryValueExA(HKEY_LOCAL_MACHINE,
-                         "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
-                         nullptr, nullptr, (LPBYTE)value, &cb);
-    if (st == ERROR_SUCCESS && cb > 1) {
-        std::string v(value, cb - 1);  // strip the terminating NUL
-        size_t i = 0;
-        while (i < v.size()) {
-            while (i < v.size() && v[i] == ',') ++i;
-            size_t e = v.find(',', i);
-            if (e == std::string::npos) e = v.size();
-            if (e > i) {
-                std::wstring p = Utf8ToWide(v.substr(i, e - i));
-                TrimRight(p);
-                if (!p.empty()) out.push_back(p);
-            }
-            i = e;
+    wchar_t value[2048] = L"";
+    DWORD cb = sizeof(value) - sizeof(wchar_t);   // keep a final NUL for the walk below
+    LSTATUS st = RegGetValueW(HKEY_LOCAL_MACHINE,
+                              L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+                              L"ExistingPageFiles", RRF_RT_REG_MULTI_SZ, nullptr, value, &cb);
+    if (st == ERROR_SUCCESS) {
+        for (const wchar_t* p = value; *p; p += wcslen(p) + 1) {
+            std::wstring s = p;
+            if (s.compare(0, 4, L"\\??\\") == 0) s.erase(0, 4);   // NT prefix -> Win32 path
+            TrimRight(s);
+            if (s.size() > 3 && s[1] == L':') out.push_back(s);
         }
     }
-    // PagefileList empty/absent (system-managed default) => <system volume>\pagefile.sys.
+    // Not listed (value absent) => the default <system volume>\pagefile.sys.
     if (out.empty()) {
         std::wstring sv = GetSystemVolume();
         if (!sv.empty()) out.push_back(sv + L"pagefile.sys");
@@ -1250,10 +1260,322 @@ static std::wstring GetHiberfilPath() {
     return sv.empty() ? std::wstring() : sv + L"hiberfil.sys";
 }
 
+// Reads the directory entry rather than the file: GetFileAttributesW opens the
+// file, which fails with a sharing violation on pagefile.sys / hiberfil.sys.
 static bool FilePresent(const std::wstring& p) {
-    DWORD a = GetFileAttributesW(p.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(p.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FindClose(h);
+    return !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
 }
+
+// ---------------------------------------------------------------------------
+//  Raw NTFS reading of a locked file
+//
+//  The kernel opens pagefile.sys and hiberfil.sys with no sharing at all, so
+//  CreateFile fails with ERROR_SHARING_VIOLATION even for an Administrator,
+//  even for attribute-only access. Instead: list the parent directory (which
+//  gives the file's MFT record number without opening the file), fetch that
+//  record from the volume with FSCTL_GET_NTFS_FILE_RECORD, decode the cluster
+//  runs of its unnamed $DATA attribute, and read those clusters directly from
+//  the volume. NTFS only. The file is live, so the copy reflects its contents
+//  at the moment each block is read (as with any live acquisition).
+// ---------------------------------------------------------------------------
+
+// One run of clusters: file clusters [vcn, vcn + clusters) are at volume
+// cluster lcn (or not allocated at all when sparse - they read as zeros).
+struct RawExtent { UINT64 vcn, lcn, clusters; bool sparse; };
+
+struct RawFileMap {
+    HANDLE volume = INVALID_HANDLE_VALUE;   // opened for raw reads
+    UINT64 cluster = 0;                     // bytes per cluster
+    UINT64 size = 0;                        // file size
+    UINT64 validSize = 0;                   // initialized size; bytes past it read as zero
+    std::vector<RawExtent> extents;         // sorted by vcn, covering the file
+    RawFileMap() = default;
+    RawFileMap(const RawFileMap&) = delete;
+    RawFileMap& operator=(const RawFileMap&) = delete;
+    ~RawFileMap() { if (volume != INVALID_HANDLE_VALUE) CloseHandle(volume); }
+};
+
+static UINT16 Rd16(const BYTE* p) { return (UINT16)(p[0] | (p[1] << 8)); }
+static UINT32 Rd32(const BYTE* p) { return (UINT32)Rd16(p) | ((UINT32)Rd16(p + 2) << 16); }
+static UINT64 Rd64(const BYTE* p) { return (UINT64)Rd32(p) | ((UINT64)Rd32(p + 4) << 32); }
+static const UINT64 kMftRefMask = 0x0000FFFFFFFFFFFFull;   // record number (low 48 bits)
+
+// MFT record number of path, read from its parent directory's listing.
+static bool FindFileRecordNumber(const std::wstring& path, UINT64& frn) {
+    size_t sl = path.find_last_of(L"\\/");
+    if (sl == std::wstring::npos) return false;
+    std::wstring dir = path.substr(0, sl + 1), name = path.substr(sl + 1);
+    HANDLE hd = CreateFileW(dir.c_str(), FILE_LIST_DIRECTORY,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (hd == INVALID_HANDLE_VALUE) return false;
+    std::vector<ULONGLONG> buf(64 * 1024 / sizeof(ULONGLONG));   // 8-byte aligned
+    FILE_INFO_BY_HANDLE_CLASS cls = FileIdBothDirectoryRestartInfo;
+    bool found = false;
+    while (!found && GetFileInformationByHandleEx(hd, cls, buf.data(),
+                                                  (DWORD)(buf.size() * sizeof(ULONGLONG)))) {
+        cls = FileIdBothDirectoryInfo;
+        auto* e = (FILE_ID_BOTH_DIR_INFO*)buf.data();
+        for (;;) {
+            std::wstring n(e->FileName, e->FileNameLength / sizeof(wchar_t));
+            if (_wcsicmp(n.c_str(), name.c_str()) == 0) {
+                frn = (UINT64)e->FileId.QuadPart;
+                found = true;
+                break;
+            }
+            if (!e->NextEntryOffset) break;
+            e = (FILE_ID_BOTH_DIR_INFO*)((BYTE*)e + e->NextEntryOffset);
+        }
+    }
+    CloseHandle(hd);
+    return found;
+}
+
+// One MFT record (FILE record segment) by number, with the update-sequence
+// fixups applied if the driver has not already applied them.
+static bool ReadMftRecord(HANDLE vol, UINT64 frn, DWORD recSize, std::vector<BYTE>& rec) {
+    NTFS_FILE_RECORD_INPUT_BUFFER in;
+    in.FileReferenceNumber.QuadPart = (LONGLONG)(frn & kMftRefMask);
+    std::vector<BYTE> out(sizeof(NTFS_FILE_RECORD_OUTPUT_BUFFER) + recSize);
+    DWORD br = 0;
+    if (!DeviceIoControl(vol, FSCTL_GET_NTFS_FILE_RECORD, &in, sizeof(in),
+                         out.data(), (DWORD)out.size(), &br, nullptr))
+        return false;
+    auto* o = (NTFS_FILE_RECORD_OUTPUT_BUFFER*)out.data();
+    // The FSCTL returns the nearest in-use record at or below the one asked for.
+    if (((UINT64)o->FileReferenceNumber.QuadPart & kMftRefMask) != (frn & kMftRefMask))
+        return false;
+    if (o->FileRecordLength < 64 || o->FileRecordLength > recSize) return false;
+    rec.assign(o->FileRecordBuffer, o->FileRecordBuffer + o->FileRecordLength);
+    if (memcmp(rec.data(), "FILE", 4) != 0) return false;
+    UINT16 usaOff = Rd16(&rec[4]), usaCount = Rd16(&rec[6]);
+    if (usaCount >= 2 && (size_t)usaOff + usaCount * 2u <= rec.size()) {
+        size_t stride = rec.size() / (usaCount - 1);
+        UINT16 usn = Rd16(&rec[usaOff]);
+        bool present = true;
+        for (UINT16 i = 1; i < usaCount && present; ++i)
+            present = i * stride <= rec.size() && Rd16(&rec[i * stride - 2]) == usn;
+        if (present)
+            for (UINT16 i = 1; i < usaCount; ++i)
+                memcpy(&rec[i * stride - 2], &rec[usaOff + 2 * i], 2);
+    }
+    return true;
+}
+
+// Decode an NTFS mapping-pairs array (the run list) starting at file cluster vcn.
+static bool DecodeRuns(const BYTE* p, const BYTE* end, UINT64 vcn, std::vector<RawExtent>& out) {
+    INT64 lcn = 0;
+    while (p < end && *p) {
+        int lenSz = *p & 0x0F, offSz = *p >> 4;
+        ++p;
+        if (lenSz == 0 || lenSz > 8 || offSz > 8 || p + lenSz + offSz > end) return false;
+        UINT64 len = 0;
+        for (int i = 0; i < lenSz; ++i) len |= (UINT64)p[i] << (8 * i);
+        p += lenSz;
+        if (offSz == 0) {
+            out.push_back({ vcn, 0, len, true });            // sparse run
+        } else {
+            UINT64 d = 0;
+            for (int i = 0; i < offSz; ++i) d |= (UINT64)p[i] << (8 * i);
+            if (offSz < 8 && (p[offSz - 1] & 0x80)) d |= ~0ull << (8 * offSz);   // sign-extend
+            lcn += (INT64)d;
+            if (lcn < 0) return false;
+            out.push_back({ vcn, (UINT64)lcn, len, false });
+        }
+        p += offSz;
+        vcn += len;
+    }
+    return true;
+}
+
+// Read whole clusters of a run list from the volume (for a non-resident
+// attribute list; small).
+static bool ReadRunsRaw(HANDLE vol, UINT64 cluster, const std::vector<RawExtent>& runs,
+                        UINT64 bytes, std::vector<BYTE>& out) {
+    out.clear();
+    for (const RawExtent& e : runs) {
+        size_t at = out.size();
+        out.resize(at + (size_t)(e.clusters * cluster));
+        if (e.sparse) continue;
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG)(e.lcn * cluster);
+        DWORD rd = 0;
+        if (!SetFilePointerEx(vol, li, nullptr, FILE_BEGIN) ||
+            !ReadFile(vol, &out[at], (DWORD)(e.clusters * cluster), &rd, nullptr) ||
+            rd != e.clusters * cluster)
+            return false;
+    }
+    if (out.size() < bytes) return false;
+    out.resize((size_t)bytes);
+    return true;
+}
+
+// Walk one record's attributes: add the unnamed $DATA runs to map (sizes from
+// the segment that starts at VCN 0) and, when attrList is given, return the
+// $ATTRIBUTE_LIST contents.
+static bool ParseDataAttribute(const std::vector<BYTE>& rec, RawFileMap& map, bool& haveSizes,
+                               std::vector<BYTE>* attrList, std::wstring& err) {
+    size_t a = Rd16(&rec[0x14]);                          // first attribute
+    while (a + 16 <= rec.size()) {
+        UINT32 type = Rd32(&rec[a]);
+        if (type == 0xFFFFFFFF) break;
+        UINT32 len = Rd32(&rec[a + 4]);
+        if (len < 16 || a + len > rec.size()) { err = L"malformed MFT record"; return false; }
+        const BYTE* at = &rec[a];
+        bool nonResident = at[8] != 0;
+        BYTE nameLen = at[9];
+        UINT16 flags = Rd16(at + 0x0C);
+        if (type == 0x80 && nameLen == 0) {
+            if (!nonResident || len < 0x40) { err = L"unexpected resident $DATA"; return false; }
+            if (flags & 0x4001) { err = L"file is compressed or encrypted"; return false; }
+            UINT64 startVcn = Rd64(at + 0x10);
+            if (startVcn == 0) {
+                map.size = Rd64(at + 0x30);
+                map.validSize = Rd64(at + 0x38);
+                haveSizes = true;
+            }
+            if (!DecodeRuns(at + Rd16(at + 0x20), at + len, startVcn, map.extents)) {
+                err = L"malformed run list";
+                return false;
+            }
+        } else if (type == 0x20 && attrList) {            // $ATTRIBUTE_LIST
+            if (!nonResident) {
+                UINT32 vlen = Rd32(at + 0x10);
+                UINT16 voff = Rd16(at + 0x14);
+                if ((size_t)voff + vlen > len) { err = L"malformed attribute list"; return false; }
+                attrList->assign(at + voff, at + voff + vlen);
+            } else {
+                std::vector<RawExtent> runs;
+                if (len < 0x40 || !DecodeRuns(at + Rd16(at + 0x20), at + len, 0, runs) ||
+                    !ReadRunsRaw(map.volume, map.cluster, runs, Rd64(at + 0x30), *attrList)) {
+                    err = L"could not read the attribute list";
+                    return false;
+                }
+            }
+        }
+        a += len;
+    }
+    return true;
+}
+
+// Build the cluster map of a locked file on an NTFS volume (see above).
+static bool MapLockedFile(const std::wstring& path, RawFileMap& map, std::wstring& err) {
+    wchar_t mount[MAX_PATH] = L"", vol[MAX_PATH] = L"", fs[64] = L"";
+    if (!GetVolumePathNameW(path.c_str(), mount, MAX_PATH) ||
+        !GetVolumeInformationW(mount, nullptr, 0, nullptr, nullptr, nullptr, fs, 64) ||
+        !GetVolumeNameForVolumeMountPointW(mount, vol, MAX_PATH)) {
+        err = L"could not identify the volume of " + path + L" (error " + std::to_wstring(GetLastError()) + L")";
+        return false;
+    }
+    if (_wcsicmp(fs, L"NTFS") != 0) {
+        err = path + L" is on a " + fs + L" volume; reading a locked file is supported on NTFS only";
+        return false;
+    }
+    std::wstring volPath = vol;
+    if (!volPath.empty() && volPath.back() == L'\\') volPath.pop_back();   // \\?\Volume{...}
+    map.volume = CreateFileW(volPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_EXISTING, 0, nullptr);
+    if (map.volume == INVALID_HANDLE_VALUE) {
+        err = L"could not open the volume for raw reading (error " + std::to_wstring(GetLastError()) + L")";
+        return false;
+    }
+    NTFS_VOLUME_DATA_BUFFER vd = {};
+    DWORD br = 0;
+    if (!DeviceIoControl(map.volume, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0, &vd, sizeof(vd), &br, nullptr)) {
+        err = L"could not read NTFS volume data (error " + std::to_wstring(GetLastError()) + L")";
+        return false;
+    }
+    map.cluster = vd.BytesPerCluster;
+    DWORD recSize = vd.BytesPerFileRecordSegment;
+
+    UINT64 frn = 0;
+    std::vector<BYTE> rec, attrList;
+    bool haveSizes = false;
+    if (!FindFileRecordNumber(path, frn) || !ReadMftRecord(map.volume, frn, recSize, rec)) {
+        err = L"could not locate the MFT record of " + path;
+        return false;
+    }
+    if (!ParseDataAttribute(rec, map, haveSizes, &attrList, err)) return false;
+
+    // A heavily fragmented file continues its $DATA runs in other records,
+    // listed in $ATTRIBUTE_LIST: type u32 @0, length u16 @4, name length @6,
+    // record reference u64 @0x10.
+    std::vector<UINT64> seen{ frn & kMftRefMask };
+    for (size_t o = 0; o + 0x1A <= attrList.size();) {
+        UINT16 elen = Rd16(&attrList[o + 4]);
+        if (elen < 0x1A || o + elen > attrList.size()) break;
+        UINT64 ref = Rd64(&attrList[o + 0x10]) & kMftRefMask;
+        if (Rd32(&attrList[o]) == 0x80 && attrList[o + 6] == 0 &&
+            std::find(seen.begin(), seen.end(), ref) == seen.end()) {
+            seen.push_back(ref);
+            std::vector<BYTE> ext;
+            if (!ReadMftRecord(map.volume, ref, recSize, ext) ||
+                !ParseDataAttribute(ext, map, haveSizes, nullptr, err)) {
+                if (err.empty()) err = L"could not read an extension MFT record";
+                return false;
+            }
+        }
+        o += elen;
+    }
+
+    // The runs must cover the file from cluster 0 without gaps.
+    std::sort(map.extents.begin(), map.extents.end(),
+              [](const RawExtent& x, const RawExtent& y) { return x.vcn < y.vcn; });
+    UINT64 next = 0;
+    for (const RawExtent& e : map.extents) {
+        if (e.vcn != next) { err = L"incomplete cluster map"; return false; }
+        next += e.clusters;
+    }
+    if (!haveSizes || next * map.cluster < map.size) { err = L"incomplete cluster map"; return false; }
+    if (map.validSize > map.size) map.validSize = map.size;
+    return true;
+}
+
+// Sequential reader over a RawFileMap. cap (the buffer size) must be a
+// multiple of the cluster size and buf sector-aligned.
+class RawFileReader {
+public:
+    explicit RawFileReader(const RawFileMap& m) : m_map(m) {}
+    // Next bytes of the file (got = 0 at the end). False on a read error.
+    bool Read(BYTE* buf, DWORD cap, DWORD& got) {
+        got = 0;
+        if (m_off >= m_map.size) return true;
+        const UINT64 cl = m_map.cluster;
+        while (m_i < m_map.extents.size() &&
+               (m_map.extents[m_i].vcn + m_map.extents[m_i].clusters) * cl <= m_off)
+            ++m_i;
+        if (m_i >= m_map.extents.size()) return false;
+        const RawExtent& e = m_map.extents[m_i];
+        UINT64 inExt = m_off - e.vcn * cl;                               // cluster-aligned
+        UINT64 len = min((UINT64)cap, e.clusters * cl - inExt);          // whole clusters
+        if (e.sparse) {
+            memset(buf, 0, (size_t)len);
+        } else {
+            LARGE_INTEGER li;
+            li.QuadPart = (LONGLONG)(e.lcn * cl + inExt);
+            DWORD rd = 0;
+            if (!SetFilePointerEx(m_map.volume, li, nullptr, FILE_BEGIN) ||
+                !ReadFile(m_map.volume, buf, (DWORD)len, &rd, nullptr) || rd != len)
+                return false;
+        }
+        UINT64 n = min(len, m_map.size - m_off);
+        if (m_off + n > m_map.validSize) {                               // past valid data
+            UINT64 z = m_map.validSize > m_off ? m_map.validSize - m_off : 0;
+            memset(buf + z, 0, (size_t)(n - z));
+        }
+        m_off += n;
+        got = (DWORD)n;
+        return true;
+    }
+private:
+    const RawFileMap& m_map;
+    size_t m_i = 0;
+    UINT64 m_off = 0;
+};
 
 // The .meta sidecar for one requested system file (written on every outcome -
 // success, partial, or "not found" - so the record exists either way).
@@ -1278,7 +1600,7 @@ static void WriteSysFileMeta(const SysFileCapture& sf, const std::wstring& metaP
     m += L"Finished:    ";  m += FormatUtcAndLocal(sf.endUtc);  m += L"\n";
     m += L"Size:        ";  m += std::to_wstring(sf.bytes);  m += L" bytes\n";
     m += L"SHA-256:     ";  m += ht(sf.sha256);  m += L"\n";
-    m += L"Method:      Locked-file copy (Administrator, full read sharing)\n";
+    if (!sf.method.empty()) { m += L"Method:      "; m += sf.method; m += L"\n"; }
     m += L"Note:        ";
     if (memComplete)
         m += L"Collected alongside the RAMstain memory image.\n";
@@ -1300,52 +1622,78 @@ static void WriteSysFileMeta(const SysFileCapture& sf, const std::wstring& metaP
 // Copy one source file to dst, hashing in the same pass. Returns true when the
 // whole file was copied. On a partial/failed copy, dst is removed and
 // sf.error is set; on success sf.path/sha256/bytes/timestamps are filled.
+// A file the OS holds open without sharing (always the case for a live
+// pagefile.sys / hiberfil.sys) is read raw from the NTFS volume instead.
 static bool CopySystemFile(const std::wstring& src, const std::wstring& dst, SysFileCapture& sf) {
-    // Open with the widest sharing so a file locked by the OS is still readable.
+    sf.source = src;
     HANDLE hIn = CreateFileW(src.c_str(), GENERIC_READ,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hIn == INVALID_HANDLE_VALUE) {
-        sf.error = L"could not open " + src + L" (error " + std::to_wstring(GetLastError()) + L").";
-        return false;
+    RawFileMap map;
+    if (hIn != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER sz = {0};
+        GetFileSizeEx(hIn, &sz);
+        sf.bytes = (UINT64)sz.QuadPart;
+        sf.method = L"File copy (Administrator)";
+    } else {
+        DWORD code = GetLastError();
+        if (code != ERROR_SHARING_VIOLATION) {
+            sf.error = L"could not open " + src + L" (error " + std::to_wstring(code) + L").";
+            return false;
+        }
+        std::wstring why;
+        if (!MapLockedFile(src, map, why)) {
+            sf.error = L"file is locked by Windows and raw reading failed: " + why + L".";
+            return false;
+        }
+        sf.bytes = map.size;
+        sf.method = L"Raw NTFS read from the volume (file locked by Windows; live contents)";
     }
-    LARGE_INTEGER sz = {0};
-    GetFileSizeEx(hIn, &sz);
-    sf.bytes = (UINT64)sz.QuadPart;
-    sf.source = src;
+    RawFileReader raw(map);
 
     DeleteFileW(dst.c_str());  // replace a stale copy; overwrite was confirmed
     HANDLE hOut = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr,
                               CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
     if (hOut == INVALID_HANDLE_VALUE) {
-        CloseHandle(hIn);
+        if (hIn != INVALID_HANDLE_VALUE) CloseHandle(hIn);
         sf.error = L"could not create " + dst + L" (error " + std::to_wstring(GetLastError()) + L").";
         return false;
     }
 
     // Hash on a background thread while the next block is read and written.
+    // (8 MiB is a multiple of any NTFS cluster size, as the raw reader needs.)
     const DWORD kBlock = 8 * 1024 * 1024;
     HashPipeline hash(kBlock, 0);
     UINT64 done = 0, lastPosted = 0;
     double totalDouble = sf.bytes > 0 ? (double)sf.bytes : 1.0;
     bool ok = true;
     GetSystemTimeAsFileTime(&sf.startUtc);
-    for (;;) {
+    while (done < sf.bytes) {
         if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) { ok = false; break; }
-        if (sf.bytes > 0 && done >= sf.bytes) break;
-        DWORD want = (DWORD)min((UINT64)kBlock, sf.bytes - done);
-        LARGE_INTEGER li; li.QuadPart = (LONGLONG)done;
-        SetFilePointerEx(hIn, li, nullptr, FILE_BEGIN);
         BYTE* buf = hash.Acquire();
         DWORD rd = 0;
-        if (!ReadFile(hIn, buf, want, &rd, nullptr) || rd == 0) {
-            if (!(sf.bytes > 0 && done < sf.bytes)) ok = false;  // expected EOF at the end is fine
+        bool readOk = (hIn != INVALID_HANDLE_VALUE)
+            ? ReadFile(hIn, buf, (DWORD)min((UINT64)kBlock, sf.bytes - done), &rd, nullptr) != FALSE
+            : raw.Read(buf, kBlock, rd);
+        if (!readOk) {
+            ok = false;
+            sf.error = L"read failed at offset " + std::to_wstring(done) + L" (error " +
+                       std::to_wstring(GetLastError()) + L"); partial copy discarded.";
             break;
         }
-        LARGE_INTEGER liOut; liOut.QuadPart = (LONGLONG)done;
-        if (!SetFilePointerEx(hOut, liOut, nullptr, FILE_BEGIN) ||
-            !WriteFile(hOut, buf, rd, nullptr, nullptr)) { ok = false; break; }
+        if (rd == 0) {
+            ok = false;
+            sf.error = L"source file shrank while being read (copied " + std::to_wstring(done) +
+                       L" of " + std::to_wstring(sf.bytes) + L" bytes); partial copy discarded.";
+            break;
+        }
+        if (!WriteFile(hOut, buf, rd, nullptr, nullptr)) {
+            ok = false;
+            sf.error = L"write failed (error " + std::to_wstring(GetLastError()) +
+                       L"); partial copy discarded.";
+            break;
+        }
         hash.Submit(rd);
         done += rd;
         if (done - lastPosted >= 64ull * 1024 * 1024) {
@@ -1356,11 +1704,6 @@ static bool CopySystemFile(const std::wstring& src, const std::wstring& dst, Sys
         }
     }
     GetSystemTimeAsFileTime(&sf.endUtc);
-    if (ok && sf.bytes > 0 && done < sf.bytes) {
-        ok = false;
-        sf.error = L"source file shrank or changed while being read (copied " +
-                   std::to_wstring(done) + L" of " + std::to_wstring(sf.bytes) + L" bytes).";
-    }
     sf.bytes = done;
     if (ok) {
         sf.sha256 = hash.Finish();
@@ -1371,7 +1714,7 @@ static bool CopySystemFile(const std::wstring& src, const std::wstring& dst, Sys
     if (ok) FlushFileBuffers(hOut);
     CloseHandle(hOut);
     if (!ok) DeleteFileW(dst.c_str());  // after the handle is closed, or the OS refuses
-    CloseHandle(hIn);
+    if (hIn != INVALID_HANDLE_VALUE) CloseHandle(hIn);
     return ok;
 }
 
@@ -2362,6 +2705,7 @@ static void SetBusy(bool busy) {
     EnableWindow(g_btnBrowse, !busy);
     EnableWindow(g_btnCapture, !busy);
     EnableWindow(g_cmbSplit, !busy);
+    EnableWindow(g_chkDriver, !busy);
     EnableWindow(g_chkPagefile, !busy);
     EnableWindow(g_chkHiberfil, !busy);
     // Stop/Close is always clickable when entering either state; OnCloseButton
@@ -2447,6 +2791,44 @@ static void OnCapture() {
             SendMessageW(g_chkDriver, BM_SETCHECK, BST_UNCHECKED, 0);
         } else {
             return;                              // cancel
+        }
+    }
+
+    // Driverless: OpenProcess(PID -1) fails with error 87 on current Windows.
+    // Find that out now rather than after a whole run (which still collects the
+    // pagefile / hibernation file, then reports the memory image as failed).
+    if (!g_driverMode && !g_selftest) {
+        EnableSeDebugPrivilege();
+        HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, (DWORD)-1);
+        DWORD code = hp ? 0 : GetLastError();
+        if (hp) CloseHandle(hp);
+        if (code) {
+            bool wantFiles = SendMessageW(g_chkPagefile, BM_GETCHECK, 0, 0) == BST_CHECKED ||
+                             SendMessageW(g_chkHiberfil, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            std::wstring why = L"The experimental driverless method does not work on this system "
+                               L"(OpenProcess(PID -1) failed with error " + std::to_wstring(code) +
+                               L"), so it cannot capture the memory image.";
+            bool imagerOk = imagerProblem.empty() && CheckImagerAvailable().empty();
+            if (imagerOk) {
+                int r = ShowSubWindow(0, L"Driverless method unavailable",
+                    why + L"\n\nUse the WinPmem driver (built into RAMstain) for this capture?",
+                    L"Use WinPmem driver", L"Cancel", L"", 520, 260);
+                if (r != 1) return;
+                g_driverMode = true;
+                SendMessageW(g_chkDriver, BM_SETCHECK, BST_CHECKED, 0);
+            } else if (wantFiles) {
+                int r = ShowSubWindow(0, L"Memory capture unavailable",
+                    why + L" The WinPmem imager is not available either.\n\n"
+                    L"Continue anyway? The pagefile / hibernation file will still be "
+                    L"collected, and the memory image will be reported as failed.",
+                    L"Continue", L"Cancel", L"", 520, 280);
+                if (r != 1) return;
+            } else {
+                ShowSubWindow(0, L"Memory capture unavailable",
+                    why + L" The WinPmem imager is not available either.",
+                    L"OK", L"", L"", 520, 240);
+                return;
+            }
         }
     }
 
@@ -2611,9 +2993,9 @@ static void OnCloseWhileCapturing() {
 
 // One-line-per-file summary of the pagefile / hibernation files collected in
 // this run, for the completion dialog (empty string when none were requested).
-static std::wstring SysFileSummary(const CaptureResult* r) {
+static std::wstring SysFileSummary(const CaptureResult* r, const wchar_t* heading = L"Also collected:") {
     if (r->sysfiles.empty()) return std::wstring();
-    std::wstring s = L"Also collected:\n";
+    std::wstring s = std::wstring(heading) + L"\n";
     for (const SysFileCapture& f : r->sysfiles) {
         std::wstring label = (f.kind == L"pagefile") ? L"Pagefile  " : L"Hiberfile ";
         if (!f.path.empty()) {
@@ -2695,9 +3077,11 @@ static void OnCaptureFinished() {
             std::wstring dir = r->path;
             size_t sl = dir.find_last_of(L"\\/");
             if (sl != std::wstring::npos) dir = dir.substr(0, sl);
-            ShowSubWindow(1, L"Memory capture failed",
-                          (r->error.empty() ? L"Memory capture failed." : r->error) +
-                          L"\n\n" + SysFileSummary(r),
+            // What was collected first; the (long) memory error after it.
+            ShowSubWindow(1, L"System files collected; memory capture failed",
+                          SysFileSummary(r, L"Collected:") +
+                          L"\nThe memory image was not captured:\n" +
+                          (r->error.empty() ? L"Memory capture failed." : r->error),
                           L"Close", L"Open folder", dir, 560, 380);
             return;
         }
