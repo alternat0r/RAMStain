@@ -3,7 +3,7 @@
 //
 //  Captures physical RAM via the signed Velocidex WinPmem imager (default):
 //  the imager loads its signed kernel driver, writes the image, and unloads.
-//  RAMstain adds the MD5 + .meta evidence sidecar. No registration, no
+//  RAMstain adds MD5 + SHA-256 and the .meta evidence sidecar. No registration, no
 //  account, no network. Offline by design.
 //
 //  An experimental driverless path (OpenProcess(PID -1) + ReadProcessMemory)
@@ -13,7 +13,7 @@
 //
 //  Output:
 //    <name>.raw   physical memory image, 4 KiB page-aligned
-//    <name>.meta  capture metadata (host, OS, kernel, size, MD5)
+//    <name>.meta  capture metadata (host, OS, kernel, size, MD5, SHA-256)
 //
 //  UI: modern flat theme (dark header band, cards, rounded owner-drawn
 //      buttons, themed progress bar), Disclaimer / Privacy / Terms dialogs.
@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdint>
 #include "md5.h"
+#include "sha256.h"
 #include "legal.h"
 #include "resource.h"
 #include "version.h"
@@ -177,34 +178,44 @@ static std::map<HWND, BtnState> g_btns;
 struct SplitPart {
     std::wstring path;
     UINT64       bytes = 0;
-    std::string  md5;                // empty when no MD5 was computed
+    std::string  md5;                // empty when no hashes were computed
+    std::string  sha256;
 };
 
 struct CaptureResult {
     bool      ok = false;
-    bool      cancelled = false;         // Stop pressed during capture (partial image, no MD5)
-    bool      hashStopped = false;       // Stop pressed while hashing a complete image (no MD5)
+    bool      cancelled = false;         // Stop pressed during capture (partial image, no hashes)
+    bool      hashStopped = false;       // Stop pressed while hashing a complete image (no hashes)
     UINT      errCode = 0;
     UINT64    pagesWritten = 0;
     UINT64    bytesWritten = 0;
     double    seconds = 0.0;
     std::wstring error;              // user-facing (empty on success)
-    std::string  md5;
+    std::string  md5;                // whole image; empty when not computed
+    std::string  sha256;
     std::wstring path;
     std::wstring metaPath;
     std::wstring method;             // "WinPmem kernel driver ..." (empty = driverless path)
-    std::vector<std::string> partMd5;// MD5 of each g_splitBytes slice, filled while hashing
+    std::vector<std::string> partMd5;    // per g_splitBytes slice, filled while hashing
+    std::vector<std::string> partSha256;
     std::vector<SplitPart>   parts;  // non-empty once the image has been split
     std::wstring splitError;         // split failed part-way (image data still intact)
 };
 
-// MD5 of consecutive fixed-size slices of a byte stream, computed alongside
-// the whole-image MD5 so a split image gets per-part hashes without a second
-// pass over the data. partSize 0 = disabled.
+// MD5 + SHA-256 of the same byte stream, fed in one pass.
+struct ImageHash {
+    MD5 md5;
+    SHA256 sha256;
+    void Update(const BYTE* p, size_t n) { md5.Update(p, n); sha256.Update(p, n); }
+};
+
+// Hashes of consecutive fixed-size slices of a byte stream, computed alongside
+// the whole-image hashes so a split image gets per-part hashes without a
+// second pass over the data. partSize 0 = disabled.
 struct PartHasher {
     UINT64 partSize = 0, inPart = 0;
-    MD5 cur;
-    std::vector<std::string> done;
+    ImageHash cur;
+    std::vector<std::string> md5s, sha256s;
     explicit PartHasher(UINT64 ps) : partSize(ps) {}
     void Update(const BYTE* p, size_t n) {
         if (!partSize) return;
@@ -212,12 +223,22 @@ struct PartHasher {
             size_t take = (size_t)min((UINT64)n, partSize - inPart);
             cur.Update(p, take);
             inPart += take; p += take; n -= take;
-            if (inPart == partSize) { done.push_back(cur.Hex()); cur.Reset(); inPart = 0; }
+            if (inPart == partSize) Close();
         }
     }
-    std::vector<std::string> Finish() {
-        if (partSize && inPart > 0) { done.push_back(cur.Hex()); cur.Reset(); inPart = 0; }
-        return done;
+    // Call once at the end; moves the results into res.
+    void Finish(struct CaptureResult* res) {
+        if (partSize && inPart > 0) Close();
+        res->partMd5 = std::move(md5s);
+        res->partSha256 = std::move(sha256s);
+    }
+private:
+    void Close() {
+        md5s.push_back(cur.md5.Hex());
+        sha256s.push_back(cur.sha256.Hex());
+        cur.md5.Reset();
+        cur.sha256.Reset();
+        inPart = 0;
     }
 };
 static CaptureResult* g_activeResult = nullptr;
@@ -397,9 +418,10 @@ static void FillSynthetic(BYTE* buf, size_t n, UINT64 off) {
         buf[i] = (BYTE)((off + i) ^ ((off + i) >> 8) ^ ((off + i) >> 16));
 }
 
-// MD5 as shown in the .meta sidecar and the completion dialog.
-static std::wstring Md5Text(const CaptureResult* res) {
-    if (!res->md5.empty()) return Utf8ToWide(res->md5);
+// A whole-image hash (res->md5 / res->sha256) as shown in the .meta sidecar
+// and the completion dialog.
+static std::wstring HashText(const CaptureResult* res, const std::string& hash) {
+    if (!hash.empty()) return Utf8ToWide(hash);
     if (res->cancelled || res->hashStopped) return L"not computed (stopped by user)";
     return L"not computed";
 }
@@ -429,19 +451,22 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
         std::wstring origName = res->path.substr(res->path.find_last_of(L"\\/") + 1);
         partsBlock =
             L"Split:       " + std::to_wstring(res->parts.size()) + L" parts of up to " +
-            std::to_wstring(res->parts.front().bytes) + L" bytes. The MD5 above is of the "
-            L"whole image (all parts joined in order).\n"
+            std::to_wstring(res->parts.front().bytes) + L" bytes. The hashes above are of "
+            L"the whole image (all parts joined in order).\n"
             L"Rejoin:      copy /b " + baseName + L".001 + " + baseName + L".002 + ... " +
             origName + L"\n";
         for (size_t i = 0; i < res->parts.size(); ++i) {
             const SplitPart& p = res->parts[i];
             wchar_t num[16];
             _snwprintf_s(num, _countof(num), _TRUNCATE, L"%03u", (unsigned)(i + 1));
+            auto h = [](const std::string& s) {
+                return s.empty() ? std::wstring(L"not computed") : Utf8ToWide(s);
+            };
             partsBlock += L"Part " + std::wstring(num) + L":    " +
                           p.path.substr(p.path.find_last_of(L"\\/") + 1) + L"  " +
-                          std::to_wstring(p.bytes) + L" bytes  MD5 " +
-                          (p.md5.empty() ? std::wstring(L"not computed") : Utf8ToWide(p.md5)) +
-                          L"\n";
+                          std::to_wstring(p.bytes) + L" bytes\n" +
+                          L"  MD5:       " + h(p.md5) + L"\n" +
+                          L"  SHA-256:   " + h(p.sha256) + L"\n";
         }
     }
     if (!res->splitError.empty())
@@ -457,7 +482,8 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
         L"Captured:    " + capTime + L" (local time)\n" +
         L"Size:        " + std::to_wstring(res->bytesWritten) + L" bytes\n" +
         L"Pages:       " + std::to_wstring(res->pagesWritten) + L" x 4096 bytes\n" +
-        L"MD5:         " + Md5Text(res) + L"\n" +
+        L"MD5:         " + HashText(res, res->md5) + L"\n" +
+        L"SHA-256:     " + HashText(res, res->sha256) + L"\n" +
         L"Tool:        RAMstain " + kVersionStr + L"\n" +
         L"Method:      " + (selftest
             ? std::wstring(L"SELF-TEST synthetic source (not a memory capture)\n")
@@ -465,7 +491,7 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
                 ? std::wstring(L"Driverless OpenProcess(PID -1) + ReadProcessMemory (experimental)\n")
                 : (res->method + L"\n"))) +
         (res->cancelled ? L"Note:        Capture stopped by user (partial image, not hashed)\n" : L"") +
-        (res->hashStopped ? L"Note:        Image complete; MD5 skipped (stopped by user during hashing)\n" : L"") +
+        (res->hashStopped ? L"Note:        Image complete; hashes skipped (stopped by user during hashing)\n" : L"") +
         partsBlock;
     std::string metaUtf8 = WideToUtf8(meta);
     HANDLE hm = CreateFileW(metaPath.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -586,8 +612,11 @@ static void SplitImage(CaptureResult* res) {
         return;
     }
     parts[0] = SplitPart{ first, ps, "" };
-    if (res->partMd5.size() == parts.size())
-        for (size_t i = 0; i < parts.size(); ++i) parts[i].md5 = res->partMd5[i];
+    if (res->partMd5.size() == parts.size() && res->partSha256.size() == parts.size())
+        for (size_t i = 0; i < parts.size(); ++i) {
+            parts[i].md5 = res->partMd5[i];
+            parts[i].sha256 = res->partSha256[i];
+        }
     res->parts = std::move(parts);
 }
 
@@ -667,8 +696,8 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 
     // Metadata is written via the shared sidecar writer (WriteMetaSidecar).
 
-    MD5 md5;
-    PartHasher partHash(g_splitBytes);   // per-part MD5s if the image will be split
+    ImageHash hash;                      // MD5 + SHA-256 while streaming
+    PartHasher partHash(g_splitBytes);   // per-part hashes if the image will be split
     std::vector<BYTE> buf(kChunkBytes);
     PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)CapturePhase::Capturing, (LPARAM)neededBytes);
 
@@ -709,7 +738,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
             aborted = true;
             break;
         }
-        md5.Update(buf.data(), got);
+        hash.Update(buf.data(), got);
         partHash.Update(buf.data(), got);
         anyWritten = true;
         offset += got;
@@ -727,10 +756,11 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 
     if (aborted) return;
     res->ok = res->bytesWritten > 0;
-    // A user-stopped (partial) image gets no MD5, same as the driver path.
+    // A user-stopped (partial) image gets no hashes, same as the driver path.
     if (!res->cancelled) {
-        res->md5 = md5.Hex();
-        res->partMd5 = partHash.Finish();
+        res->md5 = hash.md5.Hex();
+        res->sha256 = hash.sha256.Hex();
+        partHash.Finish(res);
     }
 
     // Split if requested, then write the .meta sidecar (shared with the driver path).
@@ -741,7 +771,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 //  WinPmem driver capture (the default method).
 //
 //  Runs the signed Velocidex WinPmem imager, which loads its own signed kernel
-//  driver, writes the .raw image, then unloads it. We compute the MD5 over the
+//  driver, writes the .raw image, then unloads it. We compute MD5 + SHA-256 over the
 //  resulting file and write the same .meta sidecar as the driverless path.
 //
 //  The imager is embedded in RAMstain.exe (IDR_WINPMEM, third_party/winpmem/).
@@ -959,10 +989,11 @@ static void PostPhase(CapturePhase phase, UINT64 totalBytes) {
     PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)phase, (LPARAM)totalBytes);
 }
 
-// Compute the MD5 of a completed image into res->md5 (no-op if the file is
-// missing). Only called for images that were not stopped mid-capture. If the
-// user presses Stop while hashing, the hash is abandoned (res->md5 stays empty,
-// res->hashStopped set) - a hash cut short must never be recorded.
+// Compute the MD5 and SHA-256 of a completed image in one pass into res->md5 /
+// res->sha256 (no-op if the file is missing). Only called for images that were
+// not stopped mid-capture. If the user presses Stop while hashing, the hashes
+// are abandoned (left empty, res->hashStopped set) - a hash cut short must
+// never be recorded.
 static void HashFile(CaptureResult* res) {
     HANDLE hf = CreateFileW(res->path.c_str(), GENERIC_READ,
                             FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -973,8 +1004,8 @@ static void HashFile(CaptureResult* res) {
     PostPhase(CapturePhase::Hashing, total);
     PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, 0);
 
-    MD5 md5;
-    PartHasher partHash(g_splitBytes);   // per-part MD5s in the same pass
+    ImageHash hash;                      // MD5 + SHA-256
+    PartHasher partHash(g_splitBytes);   // per-part hashes in the same pass
     std::vector<BYTE> buf(4 * 1024 * 1024);
     UINT64 done = 0, lastPosted = 0;
     for (;;) {
@@ -986,7 +1017,7 @@ static void HashFile(CaptureResult* res) {
         DWORD rd = 0;
         if (!ReadFile(hf, buf.data(), (DWORD)buf.size(), &rd, nullptr) || rd == 0)
             break;
-        md5.Update(buf.data(), rd);
+        hash.Update(buf.data(), rd);
         partHash.Update(buf.data(), rd);
         done += rd;
         if (done - lastPosted >= 64ull * 1024 * 1024) {  // ~every 64 MiB
@@ -995,8 +1026,9 @@ static void HashFile(CaptureResult* res) {
             PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)(pct > 100 ? 100 : pct), (LPARAM)done);
         }
     }
-    res->md5 = md5.Hex();
-    res->partMd5 = partHash.Finish();
+    res->md5 = hash.md5.Hex();
+    res->sha256 = hash.sha256.Hex();
+    partHash.Finish(res);
     CloseHandle(hf);
 }
 
@@ -1157,7 +1189,7 @@ static void RunDriverCapture(CaptureResult* res) {
         res->ok = (res->bytesWritten > 0);
         res->method = L"WinPmem kernel driver (" + kindName + L") - stopped by user";
         if (res->ok)
-            FinishImage(res, false);  // split if requested; no MD5 for a partial image
+            FinishImage(res, false);  // split if requested; no hashes for a partial image
         return;
     }
 
@@ -1188,7 +1220,7 @@ static void RunDriverCapture(CaptureResult* res) {
                       L", image may be incomplete";
     }
 
-    // MD5 over the whole image (plus per-part MD5s), then split if requested,
+    // MD5 + SHA-256 over the whole image (plus per-part hashes), then split if requested,
     // then the .meta sidecar (same documentation as driverless).
     HashFile(res);
     FinishImage(res, false);
@@ -2055,7 +2087,7 @@ static void OnCloseWhileCapturing() {
     int r = ShowSubWindow(0, L"Capture in progress",
         L"A memory capture is still running.\n\n"
         L"If you close RAMstain now, the capture is stopped. The partial image "
-        L"and its .meta file are kept, but no MD5 is computed.\n\n"
+        L"and its .meta file are kept, but no hashes are computed.\n\n"
         L"Stop the capture and close RAMstain?",
         L"Stop and close", L"Keep capturing", L"", 500, 270);
     if (r != 1) return;
@@ -2080,8 +2112,8 @@ static void OnCaptureFinished() {
 
     if (r->ok) {
         double mbps = (r->bytesWritten / 1024.0 / 1024.0) / (r->seconds > 0.0 ? r->seconds : 1.0);
-        std::wstring msg = (r->cancelled ? L"Capture stopped by user (partial image, MD5 not computed).\n\n"
-                            : r->hashStopped ? L"Capture complete. MD5 skipped (stopped by user during hashing).\n\n"
+        std::wstring msg = (r->cancelled ? L"Capture stopped by user (partial image, hashes not computed).\n\n"
+                            : r->hashStopped ? L"Capture complete. Hashes skipped (stopped by user during hashing).\n\n"
                             : (g_selftest ? L"Self-test complete (synthetic data).\n\n"
                                           : L"Capture complete.\n\n"));
         if (r->parts.empty()) {
@@ -2098,13 +2130,14 @@ static void OnCaptureFinished() {
                L" MB  (" + std::to_wstring(r->pagesWritten) + L" pages)\n";
         msg += L"Time:   " + FormatDuration(r->seconds) + L"\n";
         msg += L"Speed:  " + std::to_wstring((int)mbps) + L" MB/s\n";
-        msg += L"MD5:    " + Md5Text(r) + L"\n";
+        msg += L"MD5:     " + HashText(r, r->md5) + L"\n";
+        msg += L"SHA-256: " + HashText(r, r->sha256) + L"\n";
         if (!r->method.empty())
             msg += L"Method: " + r->method + L"\n";
         if (!r->metaPath.empty())
             msg += L"\nMetadata sidecar:\n" + r->metaPath + L"\n";
         if (!r->parts.empty())
-            msg += L"\nThe MD5 is of the whole image; per-part MD5s are in the .meta file.\n";
+            msg += L"\nThe hashes are of the whole image; per-part hashes are in the .meta file.\n";
         msg += L"\nStored locally. No data was transmitted anywhere.";
         std::wstring dir = r->path;
         size_t sl = dir.find_last_of(L"\\/");
@@ -2195,10 +2228,12 @@ static void OnSplitHelp() {
         L"\n"
         L"4. CHECK THE RESULT\n"
         L"\n"
+        L"    certutil -hashfile " + raw + L" SHA256\n"
         L"    certutil -hashfile " + raw + L" MD5\n"
         L"\n"
-        L"The MD5 must match the \"MD5:\" line in " + meta + L". Each part's own MD5 is "
-        L"listed there too.\n"
+        L"The results must match the \"SHA-256:\" and \"MD5:\" lines in " + meta +
+        L". Each part's own hashes are listed there too. (On Linux/macOS: sha256sum "
+        L"and md5sum.)\n"
         L"\n"
         L"Merging needs free space equal to the full image size.";
     ShowSubWindow(0, L"Merging split images", body, L"Close", L"", L"", 620, 500);
@@ -2505,7 +2540,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_phase == CapturePhase::Splitting)
                 s = L"Splitting image into parts...";
             else if (g_phase == CapturePhase::Hashing)
-                s = L"Computing MD5...";
+                s = L"Computing MD5 + SHA-256...";
             else if (g_selftest)
                 s = L"Running self-test (synthetic source)...";
             else if (g_driverMode)

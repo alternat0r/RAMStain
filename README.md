@@ -19,8 +19,8 @@ image, writing up the details, and splitting it for a FAT32 drive, all by
 hand, often under time pressure.
 
 RAMstain puts a simple window on top of WinPmem, so a capture is **point and
-click**: choose where to save, click **Capture**, and get the image, its MD5,
-and a ready-made evidence note (`.meta`) in one go. The goal is to save
+click**: choose where to save, click **Capture**, and get the image, its
+MD5 and SHA-256 hashes, and a ready-made evidence note (`.meta`) in one go. The goal is to save
 forensic analysts time and avoid mistakes, not to replace WinPmem.
 
 ---
@@ -31,10 +31,10 @@ forensic analysts time and avoid mistakes, not to replace WinPmem.
   signed [WinPmem](#credits) imager is built in.
 - **Offline.** No network calls, no telemetry, no updates.
 - **Evidence-ready output.** A `.raw` image plus a `.meta` sidecar with host,
-  OS, timestamp, size and MD5.
+  OS, timestamp, size, MD5 and SHA-256.
 - **Split images** into 1–16 GB parts (`.001`, `.002`, …), including a
   FAT32-safe 4 GB option.
-- **Live progress** for the capture and the MD5 step, with **Stop** at any
+- **Live progress** for the capture and the hashing step, with **Stop** at any
   time (the partial image is kept).
 - **Safety checks:** overwrite prompt, free-space check, and a warning if you
   close the window during a capture.
@@ -43,7 +43,7 @@ forensic analysts time and avoid mistakes, not to replace WinPmem.
 
 Run `RAMstain.exe` (it asks for Administrator rights), choose the output path,
 and click **Capture**. When it finishes you get a summary with size, time,
-speed and MD5.
+speed, MD5 and SHA-256.
 
 ### Command line
 
@@ -63,7 +63,7 @@ variable. Both the classic WinPmem 2.x and the Go imager (`go-winpmem`) work.
 | File | Contents |
 |------|----------|
 | `<name>.raw` | Physical memory image. With splitting: `<name>.001`, `<name>.002`, … |
-| `<name>.meta` | Image path, host, OS/kernel, capture time, size, MD5, tool version, method, and per-part MD5s when split. |
+| `<name>.meta` | Image path, host, OS/kernel, capture time, size, MD5, SHA-256, tool version, method, and per-part hashes when split. |
 
 Example `host1.meta`:
 
@@ -78,11 +78,13 @@ Captured:    20260928_163614 (local time)
 Size:        34359738368 bytes
 Pages:       8388608 x 4096 bytes
 MD5:         2ea471360b0e7eecd12e9f61a5d2649c
+SHA-256:     adc0a545e4ddbfc76f87b9eca80d0ab066bf9f9dd1f8390e1306f85a7bbf84fa
 Tool:        RAMstain 1.9.0
 Method:      WinPmem kernel driver (WinPmem 2.x, embedded, Velocidex signed driver)
 ```
 
-A stopped capture keeps its partial image but gets no MD5.
+Both hashes are computed in one pass over the image. A stopped capture keeps
+its partial image but gets no hashes.
 
 ## Splitting large images
 
@@ -91,8 +93,8 @@ use the `.001`, `.002`, … naming that FTK Imager, X-Ways and Autopsy open
 directly. Choose **4 GB parts (FAT32-safe)** for FAT32 USB drives.
 
 The image is split in place after capture, so the extra disk space needed is
-only one part. The `.meta` file lists each part with its own MD5; the main MD5
-covers the whole image. To rejoin:
+only one part. The `.meta` file lists each part with its own MD5 and SHA-256; the
+main hashes cover the whole image. To rejoin:
 
 ```
 copy /b host1.001 + host1.002 + host1.003 host1.raw
@@ -144,6 +146,7 @@ src/                  application source (RAMstain.cpp, resources, legal text)
 scripts/              build helpers (version bump)
 third_party/winpmem/  embedded WinPmem imager, its license, and provenance notes
 build.bat             build wrapper
+LICENSE               MIT license (RAMstain)
 ```
 
 ---
@@ -175,4 +178,8 @@ the footer links) and kept in [`src/legal.h`](src/legal.h).
 
 ## License
 
-Not yet specified. WinPmem remains under its own Apache 2.0 license.
+RAMstain is released under the [MIT License](LICENSE).
+Copyright (c) 2026 Kamil Alta.
+
+The embedded WinPmem imager is not covered by the MIT License; it remains
+under its own [Apache License 2.0](third_party/winpmem/LICENSE).
