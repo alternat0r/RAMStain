@@ -150,7 +150,8 @@ static HICON  g_hIconAbout = nullptr;   // larger icon for the About dialog (loa
 static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
               g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit,
-              g_btnSplitHelp;
+              g_btnSplitHelp, g_lblSave, g_lblSplit;
+static HWND   g_lastFocus = nullptr;    // control to refocus when the window is reactivated
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
 static bool   g_finishPending = false; // capture finished while a dialog was open
@@ -1312,7 +1313,10 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
         // fill and blue outline/glyph on hover.
         FillRect(hdc, &rc, g_brBg);
         HBRUSH brFill = CreateSolidBrush(pressed ? C.secDownFill : (st.hover ? C.secHoverFill : C.secFill));
-        HPEN pen = CreatePen(PS_SOLID, 1, st.hover ? C.accent : C.secBorder);
+        // Keyboard focus: thicker blue outline.
+        bool focusedHelp = (di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT);
+        HPEN pen = CreatePen(PS_SOLID, focusedHelp ? Sc(2, dpi) : 1,
+                             (st.hover || focusedHelp) ? C.accent : C.secBorder);
         HBRUSH ob = (HBRUSH)SelectObject(hdc, brFill);
         HPEN op = (HPEN)SelectObject(hdc, pen);
         Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
@@ -1320,8 +1324,8 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
         SelectObject(hdc, op);
         DeleteObject(brFill);
         DeleteObject(pen);
-        SetTextColor(hdc, st.hover ? C.accentHover : C.muted);
-        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(hdc, (st.hover || focusedHelp) ? C.accentHover : C.muted);
+        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old);
         return;
     }
@@ -1351,9 +1355,15 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
         }
     }
 
+    // Keyboard focus (Tab) and access-key underlines ("&Capture"): shown per
+    // the window's keyboard-cue state, which RAMstain switches on at startup.
+    bool focused = (di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT);
+    UINT prefix = (di->itemState & ODS_NOACCEL) ? DT_HIDEPREFIX : 0;
+    bool linkActive = st.hover || focused;
+
     COLORREF tcol;
     if (disabled) tcol = C.disabledText;
-    else if (st.style == BtnStyle::Link) tcol = st.hover ? C.accentHover : C.accent;
+    else if (st.style == BtnStyle::Link) tcol = linkActive ? C.accentHover : C.accent;
     else if (st.style == BtnStyle::Primary || st.style == BtnStyle::Danger) tcol = C.white;
     else tcol = st.hover ? C.accentHover : C.secText;
     SetTextColor(hdc, tcol);
@@ -1361,17 +1371,32 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
     if (st.style == BtnStyle::Link) {
         RECT tr = rc;
         tr.left += Sc(4, dpi);
-        DrawTextW(hdc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        if (st.hover) {
-            SIZE sz;
-            GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &sz);
-            int uy = rc.top + (rc.bottom - rc.top) / 2 + sz.cy / 2 + Sc(2, dpi);
-            int ux = tr.left;
-            MoveToEx(hdc, ux, uy, nullptr);
-            LineTo(hdc, ux + sz.cx, uy);
+        DrawTextW(hdc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | prefix);
+        if (linkActive) {
+            // Underline the whole label on hover/focus. Measure without the '&'.
+            RECT cr = { 0, 0, 0, 0 };
+            DrawTextW(hdc, text, -1, &cr, DT_CALCRECT | DT_SINGLELINE);
+            int uy = rc.top + (rc.bottom - rc.top) / 2 + cr.bottom / 2 + Sc(1, dpi);
+            HPEN up = CreatePen(PS_SOLID, 1, tcol);
+            HPEN op = (HPEN)SelectObject(hdc, up);
+            MoveToEx(hdc, tr.left, uy, nullptr);
+            LineTo(hdc, tr.left + cr.right, uy);
+            SelectObject(hdc, op);
+            DeleteObject(up);
         }
     } else {
-        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | prefix);
+        if (focused && !disabled) {
+            // Focus ring inside the button: white on filled (blue/red) buttons,
+            // blue on white ones.
+            RECT fr = rc;
+            InflateRect(&fr, -Sc(3, dpi), -Sc(3, dpi));
+            HPEN fp = CreatePen(PS_SOLID, Sc(2, dpi) > 1 ? Sc(2, dpi) : 2,
+                                st.style == BtnStyle::Secondary ? C.accent : C.white);
+            DrawRoundRect(hdc, fr, r > Sc(3, dpi) ? r - Sc(3, dpi) : r,
+                          (HBRUSH)GetStockObject(NULL_BRUSH), fp);
+            DeleteObject(fp);
+        }
     }
     SelectObject(hdc, old);
 }
@@ -1421,7 +1446,9 @@ static LRESULT CALLBACK OwnerButtonProc(HWND b, UINT msg, WPARAM wp, LPARAM lp,
 static HWND MakeButton(HWND parent, const wchar_t* text, int x, int y, int w, int h,
                        BtnStyle style, HMENU id, HFONT f, int dpi) {
     HWND b = CreateWindowExW(0, L"BUTTON", text,
-                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                             // WS_GROUP: each control is its own group, so arrow
+                             // keys don't hop between controls (Tab does that).
+                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_OWNERDRAW,
                              x, y, w, h, parent, id,
                              GetModuleHandleW(nullptr), nullptr);
     if (f) SendMessageW(b, WM_SETFONT, (WPARAM)f, TRUE);
@@ -1630,6 +1657,19 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ShellExecuteW(hwnd, L"open", g_subSpec.openDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             CloseSubWindow(hwnd);
             return 0;
+        case IDOK: {
+            // Enter: press the focused button, or the primary one when focus is
+            // elsewhere (e.g. in the text box).
+            HWND f = GetFocus();
+            HWND target = (f && g_btns.count(f) && GetParent(f) == hwnd)
+                              ? f : GetDlgItem(hwnd, IDC_SUB_PRIMARY);
+            if (target) SendMessageW(target, BM_CLICK, 0, 0);
+            return 0;
+        }
+        case IDCANCEL:
+            g_subResult = 0;   // same as X: cancel
+            CloseSubWindow(hwnd);
+            return 0;
         }
         return 0;
     }
@@ -1691,7 +1731,8 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
     g_subResult = 1;
     HINSTANCE hInst = GetModuleHandleW(nullptr);
     g_subHwnd = CreateWindowExW(0, kSubClass, title,
-                                WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                                // WS_CLIPCHILDREN: see the main window.
+                                WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_CLIPCHILDREN,
                                 0, 0, w, h, g_hwnd /* owner: stays above main */,
                                 nullptr, hInst, nullptr);
     if (!g_subHwnd) return 1;
@@ -1699,8 +1740,16 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
     if (g_hwnd) CenterOverParent(g_hwnd, g_subHwnd);
     // Truly modal: block input to the main window so it cannot start a capture
     // or open a second sub window (which would clobber g_subSpec / g_subHwnd).
+    // Disabling the main window drops its keyboard focus: remember the focused
+    // control now and restore it when the dialog closes.
+    HWND prevFocus = GetFocus();
+    if (prevFocus && !(g_hwnd && IsChild(g_hwnd, prevFocus))) prevFocus = nullptr;
     if (g_hwnd) EnableWindow(g_hwnd, FALSE);
     SetForegroundWindow(g_subHwnd);
+    // Keyboard: start on the primary (right-most) button - Enter/Space press
+    // it, Tab moves to the other button / the text; cues always visible.
+    SendMessageW(g_subHwnd, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEACCEL | UISF_HIDEFOCUS), 0);
+    if (HWND primary = GetDlgItem(g_subHwnd, IDC_SUB_PRIMARY)) SetFocus(primary);
     HWND self = g_subHwnd;
     while (IsWindow(self)) {
         MSG m;
@@ -1716,10 +1765,21 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
             PostMessageW(self, WM_CLOSE, 0, 0);
             continue;
         }
+        // Keyboard manager for the dialog (Tab, Space, Enter); plain typed
+        // characters bypass it, as in the main window.
+        bool plainChar = (m.message == WM_CHAR && m.wParam >= 0x20);
+        if (!plainChar && IsWindow(self) && IsDialogMessageW(self, &m))
+            continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
-    if (g_hwnd && IsWindow(g_hwnd)) EnableWindow(g_hwnd, TRUE); // safety net
+    if (g_hwnd && IsWindow(g_hwnd)) {
+        EnableWindow(g_hwnd, TRUE); // safety net
+        if (prevFocus && IsWindow(prevFocus) && IsWindowEnabled(prevFocus))
+            SetFocus(prevFocus);
+        else if (IsWindowEnabled(g_btnCapture))
+            SetFocus(g_btnCapture);
+    }
     g_subHwnd = nullptr;
     // A capture that finished while this dialog was open: handle it now, so its
     // result dialog does not open nested inside this one.
@@ -1857,7 +1917,7 @@ static void DrawMain(HDC dc, HWND hwnd) {
          g_fFoot, C.headerSub, DT_RIGHT | DT_VCENTER);
 
     // Save location: small caps label, white field with a 1px border.
-    text(L"SAVE TO", { S(kPad), S(58), W, S(72) }, g_fLabel, C.label, DT_LEFT | DT_VCENTER);
+    // (The "SAVE TO" label is a STATIC control, g_lblSave, for its Alt+T shortcut.)
     RECT er = { S(kPad), S(74), W - S(kPad) - S(kBrowseW) - S(8), S(100) };
     {
         HPEN op = (HPEN)SelectObject(dc, g_penEditBorder);
@@ -1884,10 +1944,8 @@ static void DrawMain(HDC dc, HWND hwnd) {
 
     hline(S(154));
 
-    // Options row: "Split" label in front of the combo (the combo and the
-    // driver checkbox are child controls).
-    text(L"Split", { S(kPad), S(164), S(kPad) + S(40), S(188) }, g_fSmall, C.muted,
-         DT_LEFT | DT_VCENTER);
+    // Options row: the "Split" label (g_lblSplit), combo and driver checkbox
+    // are all child controls.
 
     // Progress percentage (the bar itself is a child control) and status line.
     int pr = g_progress ? (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0) : 0;
@@ -1927,12 +1985,22 @@ static void SetBusy(bool busy) {
     // Change only the style; keep the hover flag, which OwnerButtonProc tracks.
     if (busy) {
         g_btns[g_btnClose].style = BtnStyle::Danger;
-        SetWindowTextW(g_btnClose, L"Stop");
+        SetWindowTextW(g_btnClose, L"&Stop");       // Alt+S
     } else {
         g_btns[g_btnClose].style = BtnStyle::Secondary;
-        SetWindowTextW(g_btnClose, L"Close");
+        SetWindowTextW(g_btnClose, L"Cl&ose");      // Alt+O
     }
     InvalidateRect(g_btnClose, nullptr, FALSE);
+    // Keyboard focus: disabling the focused Capture button would leave nothing
+    // focused. While busy, park focus on the window itself (so a stray Enter or
+    // Space cannot hit Stop; Tab still reaches it); afterwards, back to Capture.
+    if (g_hwnd) {
+        HWND f = GetFocus();
+        if (busy && (f == nullptr || !IsWindowEnabled(f) || f == g_btnCapture))
+            SetFocus(g_hwnd);
+        else if (!busy && (f == nullptr || f == g_hwnd))
+            SetFocus(g_btnCapture);
+    }
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -2344,23 +2412,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HINSTANCE hInst = ((LPCREATESTRUCT)lp)->hInstance;
         const int W = kDesignW;
 
+        // Keyboard: controls are created in Tab order. A text label created
+        // right before a control gives that control its Alt+letter shortcut.
+        // "SAVE &TO" label (Alt+T -> path field).
+        g_lblSave = CreateWindowExW(0, L"STATIC", L"SAVE &TO",
+                                    WS_CHILD | WS_VISIBLE | WS_GROUP | SS_LEFT | SS_CENTERIMAGE,
+                                    S(kPad), S(58), S(200), S(14),
+                                    hwnd, nullptr, hInst, nullptr);
+        SendMessageW(g_lblSave, WM_SETFONT, (WPARAM)g_fLabel, TRUE);
+
         // Save path: borderless edit inside the white field drawn in DrawMain
         // (x 16..416, y 74..100), vertically centred.
         g_editPath = CreateWindowExW(0, L"EDIT", L"",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | ES_AUTOHSCROLL,
                                       S(kPad + 5), S(79), S(W - 2 * kPad - kBrowseW - 8 - 10), S(17),
                                       hwnd, (HMENU)IDC_EDIT_PATH, hInst, nullptr);
         SendMessageW(g_editPath, WM_SETFONT, (WPARAM)g_fEdit, TRUE);
         SetTextW(g_editPath, g_cliPath.empty() ? DefaultDumpPath() : g_cliPath);
-        g_btnBrowse = MakeButton(hwnd, L"Browse...", S(W - kPad - kBrowseW), S(74), S(kBrowseW), S(26),
+        g_btnBrowse = MakeButton(hwnd, L"&Browse...", S(W - kPad - kBrowseW), S(74), S(kBrowseW), S(26),
                                  BtnStyle::Secondary, (HMENU)IDC_BTN_BROWSE, g_fSmall, dpi);
 
         // Options row (y 164..188): split drop-down after the "Split" label,
         // driver checkbox in the second column.
         // Item data = part size in MiB (0 = no split). 4095 MiB instead of 4096
         // keeps each part under FAT32's 4 GiB file limit.
+        // "S&plit" label (Alt+P -> drop-down).
+        g_lblSplit = CreateWindowExW(0, L"STATIC", L"S&plit",
+                                     WS_CHILD | WS_VISIBLE | WS_GROUP | SS_LEFT | SS_CENTERIMAGE,
+                                     S(kPad), S(164), S(38), S(24),
+                                     hwnd, nullptr, hInst, nullptr);
+        SendMessageW(g_lblSplit, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         g_cmbSplit = CreateWindowExW(0, WC_COMBOBOXW, L"",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | WS_VSCROLL | CBS_DROPDOWNLIST,
                                      S(kPad + 40), S(164), S(180), S(220),
                                      hwnd, (HMENU)IDC_CMB_SPLIT, hInst, nullptr);
         SendMessageW(g_cmbSplit, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
@@ -2402,8 +2485,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         // Default on (the driver is the primary method); --no-driver clears it.
-        g_chkDriver = CreateWindowExW(0, L"BUTTON", L"Use WinPmem driver (recommended)",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        g_chkDriver = CreateWindowExW(0, L"BUTTON", L"Use WinPmem &driver (recommended)",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
                                       S(kCol2), S(165), S(W - kPad - kCol2), S(22),
                                       hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
         SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
@@ -2420,23 +2503,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
 
         // Action row (y 246..278): "Always on top" left, Capture + Close right.
-        g_chkTop = CreateWindowExW(0, L"BUTTON", L"Always on top",
-                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        g_chkTop = CreateWindowExW(0, L"BUTTON", L"&Always on top",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
                                    S(kPad), S(252), S(130), S(20),
                                    hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
-        g_btnClose = MakeButton(hwnd, L"Close", S(W - kPad - 84), S(246), S(84), S(32),
-                                BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
-        g_btnCapture = MakeButton(hwnd, L"Capture", S(W - kPad - 84 - 8 - 104), S(246), S(104), S(32),
+        // Capture before Close so Tab goes left to right.
+        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(246), S(104), S(32),
                                   BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
+        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(246), S(84), S(32),
+                                BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
 
         // Footer links (y 290..318 strip).
-        g_btnDisc = MakeButton(hwnd, L"Disclaimer", S(12), S(kFooterY + 4), S(70), S(20),
+        g_btnDisc = MakeButton(hwnd, L"D&isclaimer", S(12), S(kFooterY + 4), S(70), S(20),
                                BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fFoot, dpi);
-        g_btnPriv = MakeButton(hwnd, L"Privacy Policy", S(84), S(kFooterY + 4), S(88), S(20),
+        g_btnPriv = MakeButton(hwnd, L"Pri&vacy Policy", S(84), S(kFooterY + 4), S(88), S(20),
                                BtnStyle::Link, (HMENU)IDC_BTN_PRIV, g_fFoot, dpi);
-        g_btnTerms = MakeButton(hwnd, L"Terms of Use", S(174), S(kFooterY + 4), S(84), S(20),
+        g_btnTerms = MakeButton(hwnd, L"Terms of &Use", S(174), S(kFooterY + 4), S(84), S(20),
                                 BtnStyle::Link, (HMENU)IDC_BTN_TERMS, g_fFoot, dpi);
 
         g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, S(24), S(24), 0);
@@ -2451,6 +2535,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_statusColor = C.muted;
         return 0;
     }
+    case WM_ACTIVATE:
+        // Remember the focused control when the window loses activation (a
+        // dialog opens, Alt+Tab) and give it focus back on return.
+        if (LOWORD(wp) == WA_INACTIVE) {
+            HWND f = GetFocus();
+            if (f && IsChild(hwnd, f)) g_lastFocus = f;
+        } else if (g_lastFocus && IsWindow(g_lastFocus) && IsWindowEnabled(g_lastFocus)) {
+            SetFocus(g_lastFocus);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_TIMER:
         if (wp == kHdrAnimTimer) {
             if (GetTickCount() - g_hdrAnimStart > kHdrAnimRun + kHdrAnimFade)
@@ -2467,10 +2562,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_CTLCOLORSTATIC:
-        // Checkboxes sit on the grey body background, not on white boxes.
+        // Checkboxes and labels sit on the grey body background, not on white boxes.
         if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver) {
             SetBkColor((HDC)wp, C.bg);
             SetTextColor((HDC)wp, C.secText);
+            return (LRESULT)g_brBg;
+        }
+        if ((HWND)lp == g_lblSave || (HWND)lp == g_lblSplit) {
+            SetBkColor((HDC)wp, C.bg);
+            SetTextColor((HDC)wp, (HWND)lp == g_lblSave ? C.label : C.muted);
             return (LRESULT)g_brBg;
         }
         [[fallthrough]];
@@ -2517,7 +2617,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Just reflect the checkbox into g_driverMode; OnCapture is the only
             // consumer and it re-reads this each time.
             return 0;
-        case IDOK:
+        case IDOK: {
+            // Enter (from the keyboard manager) when the focused control is not
+            // itself a push button: press the focused owner-drawn button, if
+            // any. Enter never closes the app or starts a capture on its own.
+            HWND f = GetFocus();
+            if (f && g_btns.count(f) && IsWindowEnabled(f))
+                SendMessageW(f, BM_CLICK, 0, 0);
+            return 0;
+        }
         case IDCANCEL:        // Esc: same as X - warn if a capture is running
             if (g_capturing) OnCloseWhileCapturing(); else OnCloseButton();
             return 0;
@@ -2785,7 +2893,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     g_hwnd = CreateWindowExW(0, kWindowClass,
                              L"RAMstain - Physical Memory Capture",
-                             WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
+                             // WS_CLIPCHILDREN: the window's own full repaint (e.g.
+                             // every status-line update) must not paint over its
+                             // child controls, which would then stay hidden.
+                             (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN,
                              x, y, w, h, nullptr, nullptr, hInstance, nullptr);
     if (!g_hwnd) return 1;
 
@@ -2795,6 +2906,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     // Force exact client size (corrects the DWM border under-count). Done after
     // ShowWindow so the final frame thickness is known.
     ForceClientSize(g_hwnd, kClientW, kClientH, true);
+    // Always show access-key underlines and focus rings (Windows otherwise
+    // hides them until Alt is pressed), then start with focus on Capture.
+    SendMessageW(g_hwnd, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEACCEL | UISF_HIDEFOCUS), 0);
+    SetFocus(g_btnCapture);
     UpdateWindow(g_hwnd);
 
     MSG m;
@@ -2816,6 +2931,42 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd)) &&
             KeyRingMatch(m.wParam))
             StartHeaderAnim(g_hwnd);
+        // F1: About.
+        if (m.message == WM_KEYDOWN && m.wParam == VK_F1 &&
+            (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd))) {
+            ShowAbout();
+            continue;
+        }
+        // Alt+access key of a checkbox: focus AND toggle it. (The keyboard
+        // manager below only moves focus to a checkbox for its access key.)
+        if (m.message == WM_SYSCHAR && (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd))) {
+            HWND hit = nullptr;
+            for (HWND c : { g_chkTop, g_chkDriver }) {
+                wchar_t t[128] = L"";
+                GetWindowTextW(c, t, 128);
+                const wchar_t* amp = wcschr(t, L'&');
+                if (amp && amp[1] && towlower(amp[1]) == towlower((wchar_t)m.wParam) &&
+                    IsWindowEnabled(c) && IsWindowVisible(c))
+                    hit = c;
+            }
+            if (hit) {
+                // Toggle explicitly and notify like a click would (BM_CLICK is
+                // unreliable when the window is not the foreground window).
+                SetFocus(hit);
+                bool on = SendMessageW(hit, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                SendMessageW(hit, BM_SETCHECK, on ? BST_UNCHECKED : BST_CHECKED, 0);
+                SendMessageW(g_hwnd, WM_COMMAND,
+                             MAKEWPARAM(GetDlgCtrlID(hit), BN_CLICKED), (LPARAM)hit);
+                continue;
+            }
+        }
+        // Keyboard manager: Tab/Shift+Tab, Space, Enter, Alt+access keys.
+        // Plain typed characters bypass it, so a letter alone never acts as an
+        // access key (only Alt+letter does) - e.g. typing B on a focused button
+        // must not open Browse.
+        bool plainChar = (m.message == WM_CHAR && m.wParam >= 0x20);
+        if (!plainChar && IsDialogMessageW(g_hwnd, &m))
+            continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

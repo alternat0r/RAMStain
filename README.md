@@ -45,6 +45,27 @@ Run `RAMstain.exe` (it asks for Administrator rights), choose the output path,
 and click **Capture**. When it finishes you get a summary with size, time,
 speed, MD5 and SHA-256.
 
+### Keyboard
+
+Everything works without a mouse. **Tab / Shift+Tab** move between controls,
+**Space** or **Enter** presses the focused button, and underlined letters work
+with **Alt**:
+
+| Keys | Action |
+|------|--------|
+| Alt+C | Capture |
+| Alt+O / Alt+S | Close / Stop (during a capture) |
+| Alt+T | Save-to path field |
+| Alt+B | Browse… |
+| Alt+P | Split drop-down |
+| Alt+D | Use WinPmem driver |
+| Alt+A | Always on top |
+| Alt+I / Alt+V / Alt+U | Disclaimer / Privacy Policy / Terms of Use |
+| F1 | About |
+| Esc | Close the open dialog, or quit (asks first during a capture) |
+
+In dialogs, Enter presses the highlighted button and Esc cancels.
+
 ### Command line
 
 ```
