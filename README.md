@@ -48,8 +48,21 @@ WinPmem.
 ## Usage
 
 Run `RAMstain.exe` (it asks for Administrator rights), choose the output path,
-and click **Capture**. When it finishes you get a summary with size, time,
-speed and SHA-256. **Copy hashes** puts the SHA-256 of every file from the run
+and click **Capture**. Each capture is saved in its own new folder next to the
+path you chose, named after the local time the capture started:
+
+```
+D:\evidence\host1.raw          <- the path you choose
+D:\evidence\RAMstain_20260928_163614\host1.raw
+                               \host1.meta
+                               \host1.log
+                               \host1__pagefile.raw ...
+```
+
+So runs never mix or overwrite each other, and missing folders are created.
+The default file name is the computer name (e.g. `WS-01.raw`).
+
+When it finishes you get a summary with size, time, speed and SHA-256. **Copy hashes** puts the SHA-256 of every file from the run
 on the clipboard in `sha256sum` format (`<hash>  <file name>`), ready to paste
 into case notes or to check later with `sha256sum -c` in the output folder.
 
@@ -81,7 +94,7 @@ In dialogs, Enter presses the highlighted button and Esc cancels.
 ### Command line
 
 ```
-RAMstain.exe "D:\evidence\host1.raw"      pre-fill the save path
+RAMstain.exe "D:\evidence\host1.raw"      pre-fill the save path (captures go in D:\evidence\RAMstain_<timestamp>\)
 RAMstain.exe --split 4095                 preselect split size in MB
 RAMstain.exe --driver "C:\tools\winpmem.exe"   use an external imager instead of the built-in one
 RAMstain.exe --no-driver                  select the experimental driverless method
@@ -107,11 +120,13 @@ variable. Both the classic WinPmem 2.x and the Go imager (`go-winpmem`) work.
 
 ## Output
 
+All files of a run are in its `RAMstain_<YYYYMMDD_HHMMSS>` folder.
+
 | File | Contents |
 |------|----------|
 | `<name>.raw` | Physical memory image. With splitting: `<name>.001`, `<name>.002`, … |
 | `<name>.meta` | Image path, host, OS/kernel, capture start and finish (UTC and local), size, SHA-256, tool version, method, and per-part hashes when split. |
-| `<name>.log` | Run log: a timestamped (UTC, millisecond) record of each run — host, user, command line, options, every step (imager start and exit code, hashing, splitting, each system file and how it was read), errors, and the final results with their SHA-256. Written as the run happens, so it survives an interrupted run; later runs to the same name are appended. |
+| `<name>.log` | Run log: a timestamped (UTC, millisecond) record of each run — host, user, command line, options, every step (imager start and exit code, hashing, splitting, each system file and how it was read), errors, and the final results with their SHA-256. Written as the run happens, so it survives an interrupted run. |
 | `<name>__pagefile.raw` + `.meta` | Collected pagefile (if requested), with its own size, SHA-256 and source path. |
 | `<name>__hiberfil.raw` + `.meta` | Collected hibernation file (if requested), same sidecar format. |
 | `<name>__swapfile.raw` + `.meta` | Collected swapfile (if requested), same sidecar format. |
@@ -121,7 +136,7 @@ Example `host1.meta`:
 ```
 RAMstain capture metadata
 =========================
-Image:       D:\evidence\host1.raw
+Image:       D:\evidence\RAMstain_20260928_163614\host1.raw
 Host:        WS-FORENSICS-01
 OS:          Windows 10.0 build 26200
 Kernel:      NT 10.0.26200

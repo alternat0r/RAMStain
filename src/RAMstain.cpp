@@ -46,6 +46,7 @@
 #include <commctrl.h>
 #include <process.h>
 #include <sddl.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 #include <map>
@@ -463,12 +464,17 @@ static std::wstring MakeTimestamp() {
     return b;
 }
 
+// Default image file name: the host name, e.g. "WS-01.raw". Each capture goes
+// into its own RAMstain_<timestamp> folder (see RunFolderFor), so the file
+// name itself needs no timestamp.
+static std::wstring GetComputerName();
+static std::wstring DefaultDumpName() {
+    std::wstring host = GetComputerName();
+    return (host.empty() ? std::wstring(L"memory") : host) + L".raw";
+}
+
 static std::wstring DefaultDumpPath() {
-    std::wstring p = GetExeDir() + L"\\RAMstain_" + MakeTimestamp() + L".raw";
-    int k = 1;
-    while (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
-        p = GetExeDir() + L"\\RAMstain_" + MakeTimestamp() + L"_" + std::to_wstring(k++) + L".raw";
-    return p;
+    return GetExeDir() + L"\\" + DefaultDumpName();
 }
 
 static void StripExtensionInPlace(std::wstring& p) {
@@ -3016,7 +3022,8 @@ static void OnCapture() {
     // If the user typed a directory, append a default file name.
     DWORD attr = GetFileAttributesW(path.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        path += L"\\RAMstain_" + MakeTimestamp() + L".raw";
+        if (path.back() != L'\\' && path.back() != L'/') path += L"\\";
+        path += DefaultDumpName();
         SetTextW(g_editPath, path);
     }
 
@@ -3110,29 +3117,6 @@ static void OnCapture() {
         if (SysWanted(k))
             for (const auto& s : SysFileSources(k)) if (FilePresent(s)) { sysBytes += GetFileBytes(s); break; }
 
-    // Confirm overwrite (the single image, or parts from an earlier split capture).
-    std::wstring base = path;
-    StripExtensionInPlace(base);
-    bool imageExists = g_captureMemory &&
-                       GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
-    bool partsExist  = g_splitBytes &&
-                       GetFileAttributesW(PartPath(base, 1).c_str()) != INVALID_FILE_ATTRIBUTES;
-    std::wstring sysExisting;                    // "__pagefile.raw already exists." lines
-    for (SysKind k : kSysKinds) {
-        std::wstring suffix = std::wstring(L"__") + SysName(k) + L".raw";
-        if (SysWanted(k) && GetFileAttributesW((base + suffix).c_str()) != INVALID_FILE_ATTRIBUTES)
-            sysExisting += L"\n" + suffix + L" already exists.";
-    }
-    if (imageExists || partsExist || !sysExisting.empty()) {
-        std::wstring q;
-        if (imageExists) { q += L"\""; q += path; q += L"\" already exists."; }
-        else if (partsExist) { q += L"Split parts \""; q += PartPath(base, 1); q += L"\", ... already exist."; }
-        q += q.empty() ? sysExisting.substr(1) : sysExisting;
-        q += L"\n\nOverwrite the existing file(s)?";
-        if (ShowSubWindow(0, L"Overwrite?", q, L"Overwrite", L"Cancel", L"", 480, 240) != 1)
-            return;
-    }
-
     // Disk-space sanity check. Splitting needs room for one extra part while it
     // moves data out of the image (see SplitImage). sysBytes is the actual size
     // of any requested pagefile / hibernation file (already measured above).
@@ -3166,11 +3150,37 @@ static void OnCapture() {
             L"folder (deleted when RAMstain closes)\n"
             L"  • temporarily load the signed WinPmem kernel driver\n"
             L"  • create and remove a temporary Windows driver service\n"
-            L"  • capture the full physical memory to your chosen path\n\n"
+            L"  • capture the full physical memory into a new timestamped folder\n\n"
             L"RAMstain is already running as Administrator.\n\nContinue?",
             L"Capture with driver", L"Cancel", L"", 500, 300);
         g_driverWarned = true;
         if (r != 1) { g_driverMode = false; return; }
+    }
+
+    // Every capture goes into a new folder next to the chosen file,
+    // <save folder>\RAMstain_<local timestamp>\<file name>, so runs never mix
+    // or overwrite each other (hence no overwrite prompt). Named and created
+    // here, after every confirmation, so the timestamp is the capture's start
+    // and a cancelled capture leaves nothing behind. Missing parent folders
+    // are created too.
+    std::wstring runDir, outPath;
+    {
+        size_t sl = path.find_last_of(L"\\/");
+        std::wstring saveDir = (sl == std::wstring::npos) ? GetExeDir() : path.substr(0, sl);
+        std::wstring name = (sl == std::wstring::npos) ? path : path.substr(sl + 1);
+        std::wstring stamp = L"RAMstain_" + MakeTimestamp();
+        runDir = saveDir + L"\\" + stamp;
+        for (int k = 2; GetFileAttributesW(runDir.c_str()) != INVALID_FILE_ATTRIBUTES; ++k)
+            runDir = saveDir + L"\\" + stamp + L"_" + std::to_wstring(k);   // same second
+        outPath = runDir + L"\\" + name;
+        int mk = SHCreateDirectoryExW(nullptr, runDir.c_str(), nullptr);
+        if (mk != ERROR_SUCCESS) {
+            ShowSubWindow(0, L"Cannot create folder",
+                          L"Could not create the capture folder:\n" + runDir +
+                          L"\n\nError " + std::to_wstring(mk) + L". Choose another save location.",
+                          L"OK", L"", L"", 480, 220);
+            return;
+        }
     }
 
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -3191,9 +3201,9 @@ static void OnCapture() {
 
     static CaptureResult s_res;
     s_res = CaptureResult();
-    s_res.path = path;
+    s_res.path = outPath;
     g_activeResult = &s_res;
-    LogRunStart(path, freeB);
+    LogRunStart(outPath, freeB);
 
     HANDLE th = CreateThread(nullptr, 0, CaptureThreadProc, &s_res, 0, nullptr);
     if (!th) {
@@ -3949,7 +3959,7 @@ static void DestroyThemeGfx() {
 // unknown option) is printed first. Returns the process exit code.
 static int ShowCommandLineHelp(const std::wstring& problem) {
     struct { const wchar_t* opt; const wchar_t* desc; } kOpts[] = {
-        { L"\"<output.raw>\"",         L"Pre-fill the save path (a folder gets a timestamped file name)" },
+        { L"\"<output.raw>\"",         L"Pre-fill the save path; each capture goes into a new RAMstain_<timestamp> folder there" },
         { L"--split <MB>",             L"Preselect the split part size in MB (0 = no split, 4095 = FAT32-safe 4 GB)" },
         { L"--driver [<imager.exe>]",  L"Use the WinPmem driver (the default); optionally an external imager" },
         { L"--no-driver",              L"Select the experimental driverless method" },
