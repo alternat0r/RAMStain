@@ -70,6 +70,7 @@
 #define IDC_PROGRESS     1008
 #define IDC_CHK_TOP      1009
 #define IDC_CHK_DRIVER   1010
+#define IDC_CMB_SPLIT    1011
 
 #define IDC_SUB_TEXT     2001
 #define IDC_SUB_PRIMARY  2002
@@ -80,7 +81,7 @@
 #define WM_APP_FINISHED (WM_APP + 2)
 #define WM_APP_PHASE    (WM_APP + 3)   // wParam = CapturePhase, lParam = expected total bytes (0 = unknown)
 
-enum class CapturePhase { Capturing = 0, Hashing = 1 };
+enum class CapturePhase { Capturing = 0, Hashing = 1, Splitting = 2 };
 
 static const wchar_t* kWindowClass = L"RAMstain.MainWindow";
 static const wchar_t* kSubClass    = L"RAMstain.SubWindow";
@@ -130,7 +131,7 @@ static HICON  g_hIcon = nullptr;
 
 static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
-              g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver;
+              g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit;
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
 static bool   g_finishPending = false; // capture finished while a dialog was open
@@ -142,6 +143,8 @@ static bool   g_driverDefault = true;// initial checkbox state (on; --no-driver 
 static bool   g_driverWarned = false;// show the driver warning once per session
 static std::wstring g_driverPath;    // explicit imager path from --driver <path>
 static std::wstring g_cliPath;
+static UINT64 g_splitBytes = 0;      // part size for this capture (0 = no split); set in OnCapture
+static UINT   g_cliSplitMB = 0;      // --split <MB> from the command line (0 = not given)
 
 static std::wstring g_status;        // status line text
 static COLORREF     g_statusColor;   // status line color
@@ -151,6 +154,13 @@ static UINT64       g_phaseTotal = 0;                  // expected bytes for g_p
 enum class BtnStyle { Primary, Secondary, Danger, Link };
 struct BtnState { BtnStyle style; bool hover; };
 static std::map<HWND, BtnState> g_btns;
+
+// One file of a split image (<base>.001, <base>.002, ...).
+struct SplitPart {
+    std::wstring path;
+    UINT64       bytes = 0;
+    std::string  md5;                // empty when no MD5 was computed
+};
 
 struct CaptureResult {
     bool      ok = false;
@@ -165,6 +175,32 @@ struct CaptureResult {
     std::wstring path;
     std::wstring metaPath;
     std::wstring method;             // "WinPmem kernel driver ..." (empty = driverless path)
+    std::vector<std::string> partMd5;// MD5 of each g_splitBytes slice, filled while hashing
+    std::vector<SplitPart>   parts;  // non-empty once the image has been split
+    std::wstring splitError;         // split failed part-way (image data still intact)
+};
+
+// MD5 of consecutive fixed-size slices of a byte stream, computed alongside
+// the whole-image MD5 so a split image gets per-part hashes without a second
+// pass over the data. partSize 0 = disabled.
+struct PartHasher {
+    UINT64 partSize = 0, inPart = 0;
+    MD5 cur;
+    std::vector<std::string> done;
+    explicit PartHasher(UINT64 ps) : partSize(ps) {}
+    void Update(const BYTE* p, size_t n) {
+        if (!partSize) return;
+        while (n > 0) {
+            size_t take = (size_t)min((UINT64)n, partSize - inPart);
+            cur.Update(p, take);
+            inPart += take; p += take; n -= take;
+            if (inPart == partSize) { done.push_back(cur.Hex()); cur.Reset(); inPart = 0; }
+        }
+    }
+    std::vector<std::string> Finish() {
+        if (partSize && inPart > 0) { done.push_back(cur.Hex()); cur.Reset(); inPart = 0; }
+        return done;
+    }
 };
 static CaptureResult* g_activeResult = nullptr;
 
@@ -362,10 +398,41 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
     std::wstring metaPath = res->path;
     StripExtensionInPlace(metaPath);
     metaPath += L".meta";
+    std::wstring imageLine = res->parts.empty()
+        ? res->path
+        : res->parts.front().path + L" ... " + res->parts.back().path +
+          L" (" + std::to_wstring(res->parts.size()) + L" parts)";
+    std::wstring partsBlock;
+    if (!res->parts.empty()) {
+        std::wstring base = res->path;
+        StripExtensionInPlace(base);
+        size_t sl = base.find_last_of(L"\\/");
+        std::wstring baseName = (sl == std::wstring::npos) ? base : base.substr(sl + 1);
+        std::wstring origName = res->path.substr(res->path.find_last_of(L"\\/") + 1);
+        partsBlock =
+            L"Split:       " + std::to_wstring(res->parts.size()) + L" parts of up to " +
+            std::to_wstring(res->parts.front().bytes) + L" bytes. The MD5 above is of the "
+            L"whole image (all parts joined in order).\n"
+            L"Rejoin:      copy /b " + baseName + L".001 + " + baseName + L".002 + ... " +
+            origName + L"\n";
+        for (size_t i = 0; i < res->parts.size(); ++i) {
+            const SplitPart& p = res->parts[i];
+            wchar_t num[16];
+            _snwprintf_s(num, _countof(num), _TRUNCATE, L"%03u", (unsigned)(i + 1));
+            partsBlock += L"Part " + std::wstring(num) + L":    " +
+                          p.path.substr(p.path.find_last_of(L"\\/") + 1) + L"  " +
+                          std::to_wstring(p.bytes) + L" bytes  MD5 " +
+                          (p.md5.empty() ? std::wstring(L"not computed") : Utf8ToWide(p.md5)) +
+                          L"\n";
+        }
+    }
+    if (!res->splitError.empty())
+        partsBlock += L"Note:        Split incomplete - " + res->splitError + L"\n";
+
     std::wstring meta =
         L"RAMstain capture metadata\n"
         L"=========================\n"
-        L"Image:       " + res->path + L"\n" +
+        L"Image:       " + imageLine + L"\n" +
         L"Host:        " + hostName + L"\n" +
         L"OS:          " + osVersion + L"\n" +
         L"Kernel:      " + kernelVer + L"\n" +
@@ -380,7 +447,8 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
                 ? std::wstring(L"Driverless OpenProcess(PID -1) + ReadProcessMemory (experimental)\n")
                 : (res->method + L"\n"))) +
         (res->cancelled ? L"Note:        Capture stopped by user (partial image, not hashed)\n" : L"") +
-        (res->hashStopped ? L"Note:        Image complete; MD5 skipped (stopped by user during hashing)\n" : L"");
+        (res->hashStopped ? L"Note:        Image complete; MD5 skipped (stopped by user during hashing)\n" : L"") +
+        partsBlock;
     std::string metaUtf8 = WideToUtf8(meta);
     HANDLE hm = CreateFileW(metaPath.c_str(), GENERIC_WRITE, 0, nullptr,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -390,6 +458,125 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
             res->metaPath = metaPath;
         CloseHandle(hm);
     }
+}
+
+// <base>.001, <base>.002, ... (the FTK / X-Ways / Autopsy split-raw convention).
+static std::wstring PartPath(const std::wstring& base, UINT64 k) {
+    wchar_t num[24];
+    _snwprintf_s(num, _countof(num), _TRUNCATE, L".%03llu", (unsigned long long)k);
+    return base + num;
+}
+
+// Split the finished image res->path into g_splitBytes-sized parts, in place.
+//
+// Works backwards from the end: copy the last slice into its part file, flush
+// it, then truncate the original to drop that slice; repeat; finally rename
+// what is left of the original to <base>.001. So the extra disk space needed
+// at any moment is one part, not a second copy of the whole image, and the
+// data is always complete on disk (a slice is removed from the original only
+// after its part file is flushed). Stop is ignored during this phase - an
+// interrupted split would leave the evidence scattered across files.
+static void SplitImage(CaptureResult* res) {
+    const UINT64 ps = g_splitBytes;
+    if (ps == 0 || !res->ok) return;
+
+    HANDLE orig = CreateFileW(res->path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (orig == INVALID_HANDLE_VALUE) {
+        res->splitError = L"could not open the image to split it (error " +
+                          std::to_wstring(GetLastError()) + L"); it was left as one file.";
+        return;
+    }
+    LARGE_INTEGER sz = {0};
+    GetFileSizeEx(orig, &sz);
+    const UINT64 total = (UINT64)sz.QuadPart;
+    if (total <= ps) { CloseHandle(orig); return; }   // fits in one part: nothing to do
+
+    std::wstring base = res->path;
+    StripExtensionInPlace(base);
+    const UINT64 n = (total + ps - 1) / ps;
+    for (UINT64 k = 1; k <= n; ++k) {
+        if (_wcsicmp(PartPath(base, k).c_str(), res->path.c_str()) == 0) {
+            CloseHandle(orig);
+            res->splitError = L"the image file name clashes with the part names (" +
+                              PartPath(base, k) + L"); it was left as one file.";
+            return;
+        }
+    }
+    // Remove parts left over from an earlier capture with the same name (the
+    // user already confirmed overwriting it), so no stale .00N survives.
+    for (UINT64 k = 1; DeleteFileW(PartPath(base, k).c_str()) ||
+                       GetLastError() != ERROR_FILE_NOT_FOUND; ++k) {}
+
+    PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)CapturePhase::Splitting, (LPARAM)(total - ps));
+    PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, 0);
+
+    std::vector<SplitPart> parts((size_t)n);
+    std::vector<BYTE> buf(4 * 1024 * 1024);
+    UINT64 end = total, moved = 0, lastPosted = 0;
+    for (UINT64 k = n; k >= 2; --k) {
+        const UINT64 off = (k - 1) * ps;
+        const UINT64 len = end - off;
+        std::wstring part = PartPath(base, k);
+        HANDLE hp = CreateFileW(part.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        bool ok = hp != INVALID_HANDLE_VALUE;
+        LARGE_INTEGER li; li.QuadPart = (LONGLONG)off;
+        ok = ok && SetFilePointerEx(orig, li, nullptr, FILE_BEGIN);
+        for (UINT64 left = len; ok && left > 0;) {
+            DWORD want = (DWORD)min((UINT64)buf.size(), left), rd = 0, wr = 0;
+            ok = ReadFile(orig, buf.data(), want, &rd, nullptr) && rd == want &&
+                 WriteFile(hp, buf.data(), rd, &wr, nullptr) && wr == rd;
+            left -= rd; moved += rd;
+            if (moved - lastPosted >= 64ull * 1024 * 1024) {
+                lastPosted = moved;
+                PostMessageW(g_hwnd, WM_APP_PROGRESS,
+                             (WPARAM)(int)((double)moved / (double)(total - ps) * 100.0),
+                             (LPARAM)moved);
+            }
+        }
+        ok = ok && FlushFileBuffers(hp);          // part is durable before we cut
+        DWORD e = ok ? 0 : GetLastError();
+        if (hp != INVALID_HANDLE_VALUE) CloseHandle(hp);
+        ok = ok && SetFilePointerEx(orig, li, nullptr, FILE_BEGIN) && SetEndOfFile(orig);
+        if (!ok) {
+            if (!e) e = GetLastError();
+            // The original still holds this slice (it is only cut after the part
+            // is flushed), so the incomplete or duplicate part file can go.
+            DeleteFileW(part.c_str());
+            CloseHandle(orig);
+            res->splitError = L"could not write part " + std::to_wstring(k) + L" (error " +
+                              std::to_wstring(e) + (e == ERROR_DISK_FULL ? L", disk full" : L"") +
+                              L"). Parts " + std::to_wstring(k + 1) + L"-" + std::to_wstring(n) +
+                              L" were written; the rest of the image is still in " + res->path +
+                              L". No data was lost.";
+            if (k == n) res->splitError = L"could not write the last part (error " +
+                              std::to_wstring(e) + (e == ERROR_DISK_FULL ? L", disk full" : L"") +
+                              L"); the image was left as one file. No data was lost.";
+            return;
+        }
+        parts[(size_t)(k - 1)] = SplitPart{ part, len, "" };
+        end = off;
+    }
+    CloseHandle(orig);
+
+    std::wstring first = PartPath(base, 1);
+    if (!MoveFileExW(res->path.c_str(), first.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        res->splitError = L"parts 2-" + std::to_wstring(n) + L" were written, but the first "
+                          L"part could not be renamed (error " + std::to_wstring(GetLastError()) +
+                          L"); it is still named " + res->path + L". No data was lost.";
+        return;
+    }
+    parts[0] = SplitPart{ first, ps, "" };
+    if (res->partMd5.size() == parts.size())
+        for (size_t i = 0; i < parts.size(); ++i) parts[i].md5 = res->partMd5[i];
+    res->parts = std::move(parts);
+}
+
+// Last step of every capture: split (if requested), then write the .meta sidecar.
+static void FinishImage(CaptureResult* res, bool selftest) {
+    SplitImage(res);
+    WriteMetaSidecar(res, selftest);
 }
 
 static void RunCapture(CaptureResult* res, bool selftest) {
@@ -463,6 +650,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
     // Metadata is written via the shared sidecar writer (WriteMetaSidecar).
 
     MD5 md5;
+    PartHasher partHash(g_splitBytes);   // per-part MD5s if the image will be split
     std::vector<BYTE> buf(kChunkBytes);
     PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)CapturePhase::Capturing, (LPARAM)neededBytes);
 
@@ -504,6 +692,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
             break;
         }
         md5.Update(buf.data(), got);
+        partHash.Update(buf.data(), got);
         anyWritten = true;
         offset += got;
         res->bytesWritten = offset;
@@ -521,11 +710,13 @@ static void RunCapture(CaptureResult* res, bool selftest) {
     if (aborted) return;
     res->ok = res->bytesWritten > 0;
     // A user-stopped (partial) image gets no MD5, same as the driver path.
-    if (!res->cancelled)
+    if (!res->cancelled) {
         res->md5 = md5.Hex();
+        res->partMd5 = partHash.Finish();
+    }
 
-    // Write .meta sidecar next to the image (shared with the driver path).
-    WriteMetaSidecar(res, selftest);
+    // Split if requested, then write the .meta sidecar (shared with the driver path).
+    FinishImage(res, selftest);
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +956,7 @@ static void HashFile(CaptureResult* res) {
     PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, 0);
 
     MD5 md5;
+    PartHasher partHash(g_splitBytes);   // per-part MD5s in the same pass
     std::vector<BYTE> buf(4 * 1024 * 1024);
     UINT64 done = 0, lastPosted = 0;
     for (;;) {
@@ -777,6 +969,7 @@ static void HashFile(CaptureResult* res) {
         if (!ReadFile(hf, buf.data(), (DWORD)buf.size(), &rd, nullptr) || rd == 0)
             break;
         md5.Update(buf.data(), rd);
+        partHash.Update(buf.data(), rd);
         done += rd;
         if (done - lastPosted >= 64ull * 1024 * 1024) {  // ~every 64 MiB
             lastPosted = done;
@@ -785,6 +978,7 @@ static void HashFile(CaptureResult* res) {
         }
     }
     res->md5 = md5.Hex();
+    res->partMd5 = partHash.Finish();
     CloseHandle(hf);
 }
 
@@ -945,7 +1139,7 @@ static void RunDriverCapture(CaptureResult* res) {
         res->ok = (res->bytesWritten > 0);
         res->method = L"WinPmem kernel driver (" + kindName + L") - stopped by user";
         if (res->ok)
-            WriteMetaSidecar(res, false);  // no MD5 for a partial image; sidecar notes the stop
+            FinishImage(res, false);  // split if requested; no MD5 for a partial image
         return;
     }
 
@@ -976,9 +1170,10 @@ static void RunDriverCapture(CaptureResult* res) {
                       L", image may be incomplete";
     }
 
-    // MD5 over the whole image + .meta sidecar (same documentation as driverless).
+    // MD5 over the whole image (plus per-part MD5s), then split if requested,
+    // then the .meta sidecar (same documentation as driverless).
     HashFile(res);
-    WriteMetaSidecar(res, false);
+    FinishImage(res, false);
 }
 
 static DWORD WINAPI CaptureThreadProc(LPVOID arg) {
@@ -1428,7 +1623,18 @@ static void DrawMain(HDC dc, HWND hwnd) {
     value(x2, Sc(228, dpi), GetOsVersionString());
 
     // Progress
-    label(Sc(32, dpi), Sc(262, dpi), L"PROGRESS");
+    // Split option (combo box g_cmbSplit sits under this label).
+    label(x1, Sc(262, dpi), L"SPLIT IMAGE");
+    {
+        HFONT ofh = (HFONT)SelectObject(dc, g_fSmall);
+        SetTextColor(dc, C.muted);
+        RECT hr2 = { Sc(284, dpi), Sc(278, dpi), W - Sc(32, dpi), Sc(306, dpi) };
+        DrawTextW(dc, L"Parts are named <name>.001, <name>.002, ...", -1, &hr2,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(dc, ofh);
+    }
+
+    label(Sc(32, dpi), Sc(314, dpi), L"PROGRESS");
     int pr = 0;
     if (g_progress) {
         int val = (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0);
@@ -1438,7 +1644,7 @@ static void DrawMain(HDC dc, HWND hwnd) {
     SetBkMode(dc, TRANSPARENT);
     HFONT of = (HFONT)SelectObject(dc, g_fBody);
     SetTextColor(dc, C.text);
-    RECT prr = { W - Sc(80, dpi), Sc(272, dpi), W - Sc(32, dpi), Sc(292, dpi) };
+    RECT prr = { W - Sc(80, dpi), Sc(324, dpi), W - Sc(32, dpi), Sc(344, dpi) };
     DrawTextW(dc, pct.c_str(), -1, &prr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, of);
 
@@ -1446,7 +1652,7 @@ static void DrawMain(HDC dc, HWND hwnd) {
     if (!g_status.empty()) {
         HFONT of2 = (HFONT)SelectObject(dc, g_fSmall);
         SetTextColor(dc, g_statusColor);
-        RECT sr2 = { Sc(32, dpi), Sc(296, dpi), W - Sc(32, dpi), Sc(316, dpi) };
+        RECT sr2 = { Sc(32, dpi), Sc(348, dpi), W - Sc(32, dpi), Sc(368, dpi) };
         DrawTextW(dc, g_status.c_str(), -1, &sr2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, of2);
     }
@@ -1455,7 +1661,7 @@ static void DrawMain(HDC dc, HWND hwnd) {
     {
         HFONT of3 = (HFONT)SelectObject(dc, g_fSmall);
         SetTextColor(dc, C.muted);
-        RECT vr = { Sc(16, dpi), Sc(402, dpi), Sc(150, dpi), Sc(424, dpi) };
+        RECT vr = { Sc(16, dpi), Sc(454, dpi), Sc(150, dpi), Sc(476, dpi) };
         DrawTextW(dc, (std::wstring(L"v") + kVersionStr).c_str(),
                   -1, &vr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, of3);
@@ -1475,6 +1681,7 @@ static void SetBusy(bool busy) {
     EnableWindow(g_editPath, !busy);
     EnableWindow(g_btnBrowse, !busy);
     EnableWindow(g_btnCapture, !busy);
+    EnableWindow(g_cmbSplit, !busy);
     // Stop/Close is always clickable when entering either state; OnCloseButton
     // disables it only while a stop is in progress.
     EnableWindow(g_btnClose, TRUE);
@@ -1551,22 +1758,43 @@ static void OnCapture() {
         }
     }
 
-    // Confirm overwrite.
-    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        std::wstring q = L"\"" + path + L"\" already exists.\n\nOverwrite the existing file?";
+    // Split option: part size in MiB from the combo's item data (0 = no split).
+    {
+        int sel = (int)SendMessageW(g_cmbSplit, CB_GETCURSEL, 0, 0);
+        LRESULT mb = (sel >= 0) ? SendMessageW(g_cmbSplit, CB_GETITEMDATA, sel, 0) : 0;
+        g_splitBytes = (mb > 0 && mb != CB_ERR) ? (UINT64)mb * 1024 * 1024 : 0;
+    }
+
+    // Confirm overwrite (the single image, or parts from an earlier split capture).
+    std::wstring base = path;
+    StripExtensionInPlace(base);
+    bool imageExists = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool partsExist  = g_splitBytes &&
+                       GetFileAttributesW(PartPath(base, 1).c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (imageExists || partsExist) {
+        std::wstring q = imageExists
+            ? L"\"" + path + L"\" already exists.\n\nOverwrite the existing file?"
+            : L"Split parts \"" + PartPath(base, 1) + L"\", ... already exist.\n\n"
+              L"Overwrite them? All existing parts of that name are replaced.";
         if (ShowSubWindow(0, L"Overwrite?", q, L"Overwrite", L"Cancel", L"", 480, 240) != 1)
             return;
     }
 
-    // Disk-space sanity check.
+    // Disk-space sanity check. Splitting needs room for one extra part while it
+    // moves data out of the image (see SplitImage).
     UINT64 needed = (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0);
     if (g_selftest) needed = 512u * 1024 * 1024;
+    UINT64 splitExtra = (g_splitBytes && g_splitBytes < needed) ? g_splitBytes : 0;
     UINT64 freeB = 0;
-    if (GetVolumeFreeBytes(path, freeB) && freeB < needed + (UINT64)(1024 * 1024 * 1024)) {
+    if (GetVolumeFreeBytes(path, freeB) &&
+        freeB < needed + splitExtra + (UINT64)(1024 * 1024 * 1024)) {
         std::wstring msg = L"Not enough free disk space.\n\n"
                            L"Estimated image size: " +
                            std::to_wstring((int)(needed / (1024 * 1024 * 1024)) + 1) +
-                           L" GB\nFree space on target volume: " +
+                           L" GB" +
+                           (splitExtra ? L" (+ " + FormatGB(splitExtra) + L" working space for splitting)"
+                                       : std::wstring()) +
+                           L"\nFree space on target volume: " +
                            std::to_wstring((int)(freeB / (1024 * 1024 * 1024))) + L" GB";
         ShowSubWindow(0, L"Not enough disk space", msg, L"OK", L"", L"", 480, 240);
         return;
@@ -1640,6 +1868,13 @@ static void OnCloseButton() {
 
 // X / Alt+F4 / Esc while a capture is running: ask before stopping it.
 static void OnCloseWhileCapturing() {
+    if (g_phase == CapturePhase::Splitting) {
+        // The image is complete; interrupting the split would scatter it
+        // across files. Let it finish, then close.
+        g_closeAfterStop = true;
+        UpdateStatus(L"Finishing the split - RAMstain will close when it is done.", C.muted);
+        return;
+    }
     if (StopRequested()) {           // already stopping: just close when done
         g_closeAfterStop = true;
         return;
@@ -1676,7 +1911,16 @@ static void OnCaptureFinished() {
                             : r->hashStopped ? L"Capture complete. MD5 skipped (stopped by user during hashing).\n\n"
                             : (g_selftest ? L"Self-test complete (synthetic data).\n\n"
                                           : L"Capture complete.\n\n"));
-        msg += L"Image:  " + r->path + L"\n";
+        if (r->parts.empty()) {
+            msg += L"Image:  " + r->path + L"\n";
+        } else {
+            msg += L"Image:  split into " + std::to_wstring(r->parts.size()) + L" parts of up to " +
+                   FormatGB(r->parts.front().bytes) + L"\n"
+                   L"        " + r->parts.front().path + L"\n"
+                   L"        ... " + r->parts.back().path + L"\n";
+        }
+        if (!r->splitError.empty())
+            msg += L"Split:  INCOMPLETE - " + r->splitError + L"\n";
         msg += L"Size:   " + std::to_wstring(r->bytesWritten / (1024 * 1024)) +
                L" MB  (" + std::to_wstring(r->pagesWritten) + L" pages)\n";
         msg += L"Time:   " + FormatDuration(r->seconds) + L"\n";
@@ -1686,6 +1930,8 @@ static void OnCaptureFinished() {
             msg += L"Method: " + r->method + L"\n";
         if (!r->metaPath.empty())
             msg += L"\nMetadata sidecar:\n" + r->metaPath + L"\n";
+        if (!r->parts.empty())
+            msg += L"\nThe MD5 is of the whole image; per-part MD5s are in the .meta file.\n";
         msg += L"\nStored locally. No data was transmitted anywhere.";
         std::wstring dir = r->path;
         size_t sl = dir.find_last_of(L"\\/");
@@ -1808,26 +2054,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Buttons
         g_btnBrowse = MakeButton(hwnd, L"Browse...", Sc(492, dpi), Sc(116, dpi), Sc(96, dpi), Sc(32, dpi),
                                  BtnStyle::Secondary, (HMENU)IDC_BTN_BROWSE, g_fSmall, dpi);
-        g_btnCapture = MakeButton(hwnd, L"Capture", Sc(32, dpi), Sc(352, dpi), Sc(150, dpi), Sc(38, dpi),
+        g_btnCapture = MakeButton(hwnd, L"Capture", Sc(32, dpi), Sc(404, dpi), Sc(150, dpi), Sc(38, dpi),
                                   BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
-        g_btnClose = MakeButton(hwnd, L"Close", Sc(194, dpi), Sc(352, dpi), Sc(120, dpi), Sc(38, dpi),
+        g_btnClose = MakeButton(hwnd, L"Close", Sc(194, dpi), Sc(404, dpi), Sc(120, dpi), Sc(38, dpi),
                                 BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
 
         // Progress bar
         g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
                                      WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
-                                     Sc(32, dpi), Sc(278, dpi), Sc(508, dpi), Sc(12, dpi),
+                                     Sc(32, dpi), Sc(330, dpi), Sc(508, dpi), Sc(12, dpi),
                                      hwnd, (HMENU)IDC_PROGRESS, hInst, nullptr);
         SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
 
         // Footer links
-        g_btnDisc = MakeButton(hwnd, L"Disclaimer", Sc(300, dpi), Sc(402, dpi), Sc(88, dpi), Sc(24, dpi),
+        g_btnDisc = MakeButton(hwnd, L"Disclaimer", Sc(300, dpi), Sc(454, dpi), Sc(88, dpi), Sc(24, dpi),
                                BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fSmall, dpi);
-        g_btnPriv = MakeButton(hwnd, L"Privacy Policy", Sc(394, dpi), Sc(402, dpi), Sc(106, dpi), Sc(24, dpi),
+        g_btnPriv = MakeButton(hwnd, L"Privacy Policy", Sc(394, dpi), Sc(454, dpi), Sc(106, dpi), Sc(24, dpi),
                                BtnStyle::Link, (HMENU)IDC_BTN_PRIV, g_fSmall, dpi);
-        g_btnTerms = MakeButton(hwnd, L"Terms of Use", Sc(506, dpi), Sc(402, dpi), Sc(92, dpi), Sc(24, dpi),
+        g_btnTerms = MakeButton(hwnd, L"Terms of Use", Sc(506, dpi), Sc(454, dpi), Sc(92, dpi), Sc(24, dpi),
                                 BtnStyle::Link, (HMENU)IDC_BTN_TERMS, g_fSmall, dpi);
 
         g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, Sc(36, dpi), Sc(36, dpi), 0);
@@ -1835,23 +2081,53 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // "Always on top" checkbox (footer, default off).
         g_chkTop = CreateWindowExW(0, L"BUTTON", L"Always on top",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                   Sc(156, dpi), Sc(401, dpi), Sc(124, dpi), Sc(24, dpi),
+                                   Sc(156, dpi), Sc(453, dpi), Sc(124, dpi), Sc(24, dpi),
                                    hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
 
         // "Use WinPmem driver" checkbox - in the button row, to the right of
         // the Close/Stop button (which ends at x=314), so it never overlaps.
-        // Vertically centered on the 38px-tall buttons (y=352..390).
+        // Vertically centered on the 38px-tall buttons (y=404..442).
         // Default on (the driver is the primary method); --no-driver clears it.
         g_chkDriver = CreateWindowExW(0, L"BUTTON",
                                       L"Use WinPmem driver (recommended)",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                      Sc(320, dpi), Sc(359, dpi), Sc(268, dpi), Sc(24, dpi),
+                                      Sc(320, dpi), Sc(411, dpi), Sc(268, dpi), Sc(24, dpi),
                                       hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
         SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkDriver, BM_SETCHECK,
                      (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // "SPLIT IMAGE" drop-down. Item data = part size in MiB (0 = no split).
+        // 4095 MiB instead of 4096 keeps each part under FAT32's 4 GiB file limit.
+        g_cmbSplit = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                                     Sc(32, dpi), Sc(278, dpi), Sc(240, dpi), Sc(220, dpi),
+                                     hwnd, (HMENU)IDC_CMB_SPLIT, hInst, nullptr);
+        SendMessageW(g_cmbSplit, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        {
+            struct { UINT mb; const wchar_t* text; } kSplit[] = {
+                { 0,     L"Do not split (one file)" },
+                { 1024,  L"1 GB parts" },
+                { 2048,  L"2 GB parts" },
+                { 4095,  L"4 GB parts (FAT32-safe, 4095 MB)" },
+                { 8192,  L"8 GB parts" },
+                { 16384, L"16 GB parts" },
+            };
+            int sel = 0;
+            for (const auto& s : kSplit) {
+                int i = (int)SendMessageW(g_cmbSplit, CB_ADDSTRING, 0, (LPARAM)s.text);
+                SendMessageW(g_cmbSplit, CB_SETITEMDATA, i, (LPARAM)s.mb);
+                if (g_cliSplitMB && s.mb == g_cliSplitMB) sel = i;
+            }
+            if (g_cliSplitMB && sel == 0) {      // --split <MB> with a non-preset size
+                std::wstring t = std::to_wstring(g_cliSplitMB) + L" MB parts (command line)";
+                sel = (int)SendMessageW(g_cmbSplit, CB_ADDSTRING, 0, (LPARAM)t.c_str());
+                SendMessageW(g_cmbSplit, CB_SETITEMDATA, sel, (LPARAM)g_cliSplitMB);
+            }
+            SendMessageW(g_cmbSplit, CB_SETCURSEL, sel, 0);
+        }
 
         g_status = L"Ready.";
         g_statusColor = C.muted;
@@ -1941,6 +2217,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_PHASE:
         g_phase = (CapturePhase)wp;
         g_phaseTotal = (UINT64)lp;
+        // Splitting cannot be stopped (see SplitImage); SetBusy(false) re-enables.
+        if (g_phase == CapturePhase::Splitting) EnableWindow(g_btnClose, FALSE);
         return 0;
     case WM_APP_PROGRESS: {
         SendMessageW(g_progress, PBM_SETPOS, (WPARAM)wp, 0);
@@ -1948,9 +2226,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // progress after Stop was pressed so "Stopping capture..." stays visible.
         UINT64 done = (UINT64)lp;
         bool stopping = g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0;
-        if (g_capturing && !stopping) {
+        if (g_capturing && (!stopping || g_phase == CapturePhase::Splitting) &&
+            !(g_closeAfterStop && g_phase == CapturePhase::Splitting)) {
             std::wstring s;
-            if (g_phase == CapturePhase::Hashing)
+            if (g_phase == CapturePhase::Splitting)
+                s = L"Splitting image into parts...";
+            else if (g_phase == CapturePhase::Hashing)
                 s = L"Computing MD5...";
             else if (g_selftest)
                 s = L"Running self-test (synthetic source)...";
@@ -1986,7 +2267,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // DWM frame, and an over-tight max would clamp the post-creation
         // client-size correction in wWinMain.
         mmi->ptMinTrackSize.x = Sc(620, dpi);
-        mmi->ptMinTrackSize.y = Sc(432, dpi);
+        mmi->ptMinTrackSize.y = Sc(484, dpi);
         mmi->ptMaxTrackSize.x = 4000;
         mmi->ptMaxTrackSize.y = 4000;
         return 0;
@@ -2069,6 +2350,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 }
             } else if (_wcsicmp(t.c_str(), L"--no-driver") == 0) {
                 g_driverDefault = false;                   // start with driverless selected
+            } else if (_wcsicmp(t.c_str(), L"--split") == 0 && k + 1 < toks.size()) {
+                // --split <MB>: preselect a part size (0 = no split). Invalid
+                // values are ignored and the drop-down keeps its default.
+                const std::wstring& v = toks[++k];
+                if (!v.empty() && wcsspn(v.c_str(), L"0123456789") == v.size() && v.size() <= 7)
+                    g_cliSplitMB = (UINT)wcstoul(v.c_str(), nullptr, 10);
             } else if (g_cliPath.empty()) {
                 g_cliPath = t;
                 TrimRight(g_cliPath);
@@ -2113,13 +2400,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     ws.lpszClassName = kSubClass;
     if (!RegisterClassExW(&ws)) return 1;
 
-    // Fixed-size main window (620x432 CLIENT @ 96dpi).
+    // Fixed-size main window (620x484 CLIENT @ 96dpi).
     // AdjustWindowRect under-counts the DWM invisible border on Win10/11, so
     // after creating we measure the real client size and nudge the window by
     // the delta to force the exact client size our layout is designed for.
     int dpi = GetDpiForSystem();
     const int kClientW = Sc(620, dpi);
-    const int kClientH = Sc(432, dpi);
+    const int kClientH = Sc(484, dpi);
     RECT rc = { 0, 0, kClientW, kClientH };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX, FALSE);
     int w = rc.right - rc.left;

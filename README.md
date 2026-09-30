@@ -46,6 +46,9 @@ integrity) is written to both the completion dialog and the `.meta` sidecar.
   during a capture, letting you cancel cleanly (a partial image + sidecar is
   kept and marked as such). No MD5 is computed for a stopped capture, and
   pressing Stop during the MD5 step keeps the complete image but skips the hash.
+- **Split images.** Optionally split the image into 1, 2, 4 (FAT32-safe),
+  8 or 16 GB parts named `<name>.001`, `<name>.002`, … (see
+  [Splitting large images](#splitting-large-images)).
 - **Pre-flight checks.** Warns on an existing destination (overwrite prompt)
   and verifies enough free disk space before starting.
 - **Modern UI.** Themed (Common Controls v6), per-monitor DPI aware, owner-drawn
@@ -108,6 +111,7 @@ RAMstain.exe
 RAMstain.exe "D:\evidence\host1.raw"                  :: pre-fill the save path
 RAMstain.exe --driver "C:\tools\go-winpmem-signed.exe" :: use an external imager instead of the built-in one
 RAMstain.exe --no-driver                              :: start with the experimental driverless path selected
+RAMstain.exe --split 4095                             :: preselect splitting into 4095 MB parts (any size in MB)
 RAMstain.exe --selftest "C:\out\test.raw"             :: run a 512 MiB synthetic pipeline test
 ```
 
@@ -121,6 +125,29 @@ verify the tool, disk, and MD5 path work end-to-end **without** capturing real
 memory. The `.meta` sidecar is clearly marked `SELF-TEST synthetic source`.
 
 ---
+
+## Splitting large images
+
+Choose a part size under **Split image** (or pass `--split <MB>`) to get the
+image as `<name>.001`, `<name>.002`, … instead of one large `.raw`. This is
+the split-raw convention that FTK Imager, X-Ways and Autopsy open directly.
+Pick **4 GB parts (FAT32-safe)** when the target is a FAT32 USB stick, which
+cannot hold files of 4 GB or more.
+
+- **How:** the imager writes one file, which RAMstain then splits in place,
+  working backwards from the end. Each part is written and flushed before
+  that data is cut from the original, so the extra disk space needed is only
+  one part, and the data is complete on disk at every moment.
+- **Hashes:** the MD5 in the dialog and `.meta` is of the whole image. The
+  `.meta` file also lists every part with its size and its own MD5, computed
+  in the same pass (no extra read).
+- **Rejoin** for tools that need a single file:
+  `copy /b name.001 + name.002 + name.003 name.raw`. The result's MD5 equals
+  the whole-image MD5.
+- **Stop** is disabled while splitting. Closing the window then lets the split
+  finish and exits afterwards.
+- An image smaller than one part is left as a single file. A capture stopped
+  part-way is still split, but has no MD5s (as before).
 
 ## Capture methods
 
