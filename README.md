@@ -10,6 +10,19 @@ pick where to save, click **Capture**.
   <img src="docs/screenshot.png" alt="RAMstain main window" width="536">
 </p>
 
+## Why RAMstain?
+
+[WinPmem](#credits) is an excellent, trusted memory imager, but it is
+**command-line only**: there is no GUI version. In the field, that means
+opening an elevated prompt, remembering the right syntax, then hashing the
+image, writing up the details, and splitting it for a FAT32 drive, all by
+hand, often under time pressure.
+
+RAMstain puts a simple window on top of WinPmem, so a capture is **point and
+click**: choose where to save, click **Capture**, and get the image, its MD5,
+and a ready-made evidence note (`.meta`) in one go. The goal is to save
+forensic analysts time and avoid mistakes, not to replace WinPmem.
+
 ---
 
 ## Features

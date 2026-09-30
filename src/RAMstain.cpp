@@ -1672,6 +1672,90 @@ static void ShowAbout() {
 // ---------------------------------------------------------------------------
 //  Main window painting
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Key history for the main-window keyboard filter, and header animation.
+// ---------------------------------------------------------------------------
+static BYTE   g_keyRing[10];            // last virtual-key codes (XOR 0x5A)
+static int    g_keyRingPos = 0;
+static DWORD  g_hdrAnimStart = 0;       // 0 = header animation not running
+static HFONT  g_fHdrAnim = nullptr;
+static int    g_hdrAnimOff[64], g_hdrAnimSpd[64];
+static const UINT_PTR kHdrAnimTimer = 0x7A;
+static const DWORD kHdrAnimRun = 4000, kHdrAnimFade = 700;   // ms
+
+// Record a key; true when the recent keys match the encoded key pattern.
+static bool KeyRingMatch(WPARAM vk) {
+    static const BYTE kKeyPattern[10] = { 0x7C, 0x7C, 0x72, 0x72, 0x7F, 0x7D, 0x7F, 0x7D, 0x18, 0x1B };
+    g_keyRing[g_keyRingPos] = (BYTE)(vk ^ 0x5A);
+    g_keyRingPos = (g_keyRingPos + 1) % 10;
+    for (int i = 0; i < 10; ++i)
+        if (g_keyRing[(g_keyRingPos + i) % 10] != kKeyPattern[i]) return false;
+    ZeroMemory(g_keyRing, sizeof(g_keyRing));
+    return true;
+}
+
+static void StartHeaderAnim(HWND hwnd) {
+    int dpi = GetDpiForWindow(hwnd);
+    UINT seed = GetTickCount() | 1;
+    for (int i = 0; i < 64; ++i) {
+        seed = seed * 1103515245u + 12345u; g_hdrAnimOff[i] = (int)((seed >> 8) % 400);
+        seed = seed * 1103515245u + 12345u; g_hdrAnimSpd[i] = 40 + (int)((seed >> 8) % 70);  // px/s
+    }
+    if (!g_fHdrAnim) {
+        LOGFONTW lf;
+        ZeroMemory(&lf, sizeof(lf));
+        lf.lfHeight = -Sc(10, dpi);
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        lf.lfQuality = CLEARTYPE_QUALITY;
+        lstrcpyW(lf.lfFaceName, L"Consolas");
+        g_fHdrAnim = CreateFontIndirectW(&lf);
+    }
+    g_hdrAnimStart = GetTickCount() | 1;
+    SetTimer(hwnd, kHdrAnimTimer, 33, nullptr);
+}
+
+static void StopHeaderAnim(HWND hwnd) {
+    KillTimer(hwnd, kHdrAnimTimer);
+    g_hdrAnimStart = 0;
+    if (g_fHdrAnim) { DeleteObject(g_fHdrAnim); g_fHdrAnim = nullptr; }
+}
+
+static COLORREF Blend(COLORREF a, COLORREF b, double t) {   // t: 0 = a, 1 = b
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return RGB((int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t),
+               (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t),
+               (int)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t));
+}
+
+// Falling hex bytes in the header band, drawn behind the title.
+static void DrawHeaderAnim(HDC dc, int W, int H, int dpi) {
+    DWORD t = GetTickCount() - g_hdrAnimStart;
+    double fade = (t < kHdrAnimRun) ? 1.0 : 1.0 - (double)(t - kHdrAnimRun) / kHdrAnimFade;
+    if (fade <= 0 || !g_fHdrAnim) return;
+    const int colW = Sc(15, dpi), rowH = Sc(11, dpi), trail = 6;
+    const COLORREF body = RGB(56, 189, 248), lead = RGB(224, 242, 254);
+    HFONT of = (HFONT)SelectObject(dc, g_fHdrAnim);
+    int cols = min(64, W / colW + 1);
+    for (int c = 0; c < cols; ++c) {
+        int span = H + trail * rowH;
+        int head = (int)((g_hdrAnimOff[c] + (long long)t * g_hdrAnimSpd[c] / 1000) % span);
+        int headRow = (int)(((long long)g_hdrAnimOff[c] + (long long)t * g_hdrAnimSpd[c] / 1000) / rowH);
+        for (int j = 0; j < trail; ++j) {
+            int y = head - j * rowH;
+            if (y < -rowH || y > H) continue;
+            double k = (1.0 - (double)j / trail) * fade * 0.85;
+            COLORREF col = (j == 0) ? Blend(C.header, lead, fade * 0.9) : Blend(C.header, body, k);
+            UINT h = (UINT)(c * 2654435761u) ^ (UINT)((headRow - j) * 40503u);
+            wchar_t hex[3] = { L"0123456789ABCDEF"[(h >> 4) & 15], L"0123456789ABCDEF"[h & 15], 0 };
+            SetTextColor(dc, col);
+            TextOutW(dc, c * colW + Sc(3, dpi), y, hex, 2);
+        }
+    }
+    SelectObject(dc, of);
+}
+
 static void DrawMain(HDC dc, HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
@@ -1696,6 +1780,8 @@ static void DrawMain(HDC dc, HWND hwnd) {
     // Header band: icon, name + subtitle, version on the right.
     RECT hr = { 0, 0, W, S(kHeaderH) };
     FillRect(dc, &hr, g_brHeader);
+    if (g_hdrAnimStart)
+        DrawHeaderAnim(dc, W, S(kHeaderH), dpi);
     if (g_hIcon)
         DrawIconEx(dc, S(kPad), S(12), g_hIcon, S(24), S(24), 0, nullptr, DI_NORMAL);
     text(L"RAMstain", { S(50), S(7), W, S(27) }, g_fTitle, C.white, DT_LEFT | DT_VCENTER);
@@ -2296,6 +2382,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_statusColor = C.muted;
         return 0;
     }
+    case WM_TIMER:
+        if (wp == kHdrAnimTimer) {
+            if (GetTickCount() - g_hdrAnimStart > kHdrAnimRun + kHdrAnimFade)
+                StopHeaderAnim(hwnd);
+            RECT hr = { 0, 0, Sc(kDesignW, GetDpiForWindow(hwnd)), Sc(kHeaderH, GetDpiForWindow(hwnd)) };
+            InvalidateRect(hwnd, &hr, FALSE);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == IDM_ABOUT) {
             ShowAbout();
@@ -2365,6 +2460,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // area. Child controls (edit, checkbox, buttons, progress bar) consume
         // their own WM_LBUTTONDOWN, so this only fires for blank space - the
         // header band, card surface, labels, status and footer gap.
+        SetFocus(hwnd);   // clicking empty space leaves the path field, like most apps
         GetCursorPos(&g_dragCursor);
         {
             RECT wr;
@@ -2493,6 +2589,7 @@ static void DestroyThemeGfx() {
         if (f) DeleteObject(f);
     if (g_hIcon) DestroyIcon(g_hIcon);
     if (g_hIconAbout) DestroyIcon(g_hIconAbout);
+    if (g_fHdrAnim) DeleteObject(g_fHdrAnim);
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
@@ -2643,6 +2740,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             SendMessageW(g_hwnd, WM_COMMAND, IDCANCEL, 0);
             continue;
         }
+        // Key history (idle only; not while typing in the path field or
+        // changing the Split selection).
+        if (m.message == WM_KEYDOWN && !g_capturing &&
+            m.hwnd != g_editPath && m.hwnd != g_cmbSplit &&
+            (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd)) &&
+            KeyRingMatch(m.wParam))
+            StartHeaderAnim(g_hwnd);
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
