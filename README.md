@@ -85,6 +85,11 @@ covers the whole image. To rejoin:
 copy /b host1.001 + host1.002 + host1.003 host1.raw
 ```
 
+List the parts explicitly: `copy /b host1.0*` can join them in the wrong order
+on FAT32/exFAT drives. The **?** button next to the Split drop-down shows these
+steps in the app, including a PowerShell one-liner for many parts and the
+Linux/macOS `cat` command.
+
 ## How it captures
 
 Reading physical memory on Windows requires a kernel driver. RAMstain uses the

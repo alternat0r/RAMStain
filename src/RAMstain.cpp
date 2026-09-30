@@ -71,6 +71,7 @@
 #define IDC_CHK_TOP      1009
 #define IDC_CHK_DRIVER   1010
 #define IDC_CMB_SPLIT    1011
+#define IDC_BTN_SPLITHELP 1012
 
 #define IDC_SUB_TEXT     2001
 #define IDC_SUB_PRIMARY  2002
@@ -147,7 +148,8 @@ static HICON  g_hIconAbout = nullptr;   // larger icon for the About dialog (loa
 
 static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
-              g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit;
+              g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit,
+              g_btnSplitHelp;
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
 static bool   g_finishPending = false; // capture finished while a dialog was open
@@ -167,7 +169,7 @@ static COLORREF     g_statusColor;   // status line color
 static CapturePhase g_phase = CapturePhase::Capturing; // current worker phase (UI thread)
 static UINT64       g_phaseTotal = 0;                  // expected bytes for g_phase (0 = unknown)
 
-enum class BtnStyle { Primary, Secondary, Danger, Link };
+enum class BtnStyle { Primary, Secondary, Danger, Link, Help };  // Help = small round "?"
 struct BtnState { BtnStyle style; bool hover; };
 static std::map<HWND, BtnState> g_btns;
 
@@ -1242,6 +1244,25 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
     HFONT old = (HFONT)SelectObject(hdc, f);
     SetBkMode(hdc, TRANSPARENT);
 
+    if (st.style == BtnStyle::Help) {
+        // Small round "?" on the body background: grey outline, light-blue
+        // fill and blue outline/glyph on hover.
+        FillRect(hdc, &rc, g_brBg);
+        HBRUSH brFill = CreateSolidBrush(pressed ? C.secDownFill : (st.hover ? C.secHoverFill : C.secFill));
+        HPEN pen = CreatePen(PS_SOLID, 1, st.hover ? C.accent : C.secBorder);
+        HBRUSH ob = (HBRUSH)SelectObject(hdc, brFill);
+        HPEN op = (HPEN)SelectObject(hdc, pen);
+        Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        DeleteObject(brFill);
+        DeleteObject(pen);
+        SetTextColor(hdc, st.hover ? C.accentHover : C.muted);
+        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, old);
+        return;
+    }
+
     int r = Sc(7, dpi);
     if (st.style == BtnStyle::Link) {
         RECT fr = rc;
@@ -1319,7 +1340,8 @@ static LRESULT CALLBACK OwnerButtonProc(HWND b, UINT msg, WPARAM wp, LPARAM lp,
     }
     case WM_SETCURSOR: {
         auto it = g_btns.find(b);
-        if (it != g_btns.end() && it->second.style == BtnStyle::Link && IsWindowEnabled(b)) {
+        if (it != g_btns.end() && IsWindowEnabled(b) &&
+            (it->second.style == BtnStyle::Link || it->second.style == BtnStyle::Help)) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
@@ -2027,6 +2049,62 @@ static std::wstring ThirdPartyNotice() {
     return s;
 }
 
+// "?" next to the Split drop-down: how to use / merge split parts. Commands
+// use the file name currently in the save-path field so they can be copied.
+static void OnSplitHelp() {
+    std::wstring path = GetTextW(g_editPath);
+    TrimRight(path);
+    size_t sl = path.find_last_of(L"\\/");
+    std::wstring name = (sl == std::wstring::npos) ? path : path.substr(sl + 1);
+    StripExtensionInPlace(name);
+    if (name.empty()) name = L"image";
+    // Quote names with spaces for cmd / PowerShell / sh.
+    auto q = [](const std::wstring& n) {
+        return n.find(L' ') != std::wstring::npos ? L"\"" + n + L"\"" : n;
+    };
+    std::wstring p1 = q(name + L".001"), p2 = q(name + L".002"), p3 = q(name + L".003");
+    std::wstring raw = q(name + L".raw"), meta = name + L".meta";
+
+    std::wstring body =
+        L"Split parts are plain slices of one image: " + name + L".001, " + name + L".002, ... "
+        L"Joined in order, they are byte-for-byte identical to the original image.\n"
+        L"\n"
+        L"1. YOU MAY NOT NEED TO MERGE\n"
+        L"FTK Imager, X-Ways Forensics and Autopsy open split images directly: select "
+        L"the .001 file. Tools that need a single file (for example Volatility) need "
+        L"the parts merged first.\n"
+        L"\n"
+        L"2. MERGE ON WINDOWS\n"
+        L"In Command Prompt, in the folder with the parts, list every part in order:\n"
+        L"\n"
+        L"    copy /b " + p1 + L" + " + p2 + L" + " + p3 + L" " + raw + L"\n"
+        L"\n"
+        L"With many parts, this PowerShell command joins all of them in name order:\n"
+        L"\n"
+        L"    $o = [IO.File]::Create(\"$PWD\\" + name + L".raw\"); "
+        L"Get-ChildItem '" + name + L".0?\?' | Sort-Object Name | ForEach-Object { "
+        L"$i = [IO.File]::OpenRead($_.FullName); $i.CopyTo($o); $i.Close() }; $o.Close()\n"
+        L"\n"
+        L"Do not use a wildcard with copy (such as copy /b " + name + L".0* ...). On "
+        L"FAT32/exFAT drives it can join the parts in the wrong order.\n"
+        L"\n"
+        L"3. MERGE ON LINUX / MACOS\n"
+        L"\n"
+        L"    cat " + q(name) + L".0?? > " + raw + L"\n"
+        L"\n"
+        L"(the shell sorts the names, so the order is correct)\n"
+        L"\n"
+        L"4. CHECK THE RESULT\n"
+        L"\n"
+        L"    certutil -hashfile " + raw + L" MD5\n"
+        L"\n"
+        L"The MD5 must match the \"MD5:\" line in " + meta + L". Each part's own MD5 is "
+        L"listed there too.\n"
+        L"\n"
+        L"Merging needs free space equal to the full image size.";
+    ShowSubWindow(0, L"Merging split images", body, L"Close", L"", L"", 620, 500);
+}
+
 static void OnLegalDoc(int which) {
     switch (which) {
     case IDC_BTN_DISC:
@@ -2140,6 +2218,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             SendMessageW(g_cmbSplit, CB_SETCURSEL, sel, 0);
         }
+        // Small round "?" right after the drop-down: how to merge split parts.
+        g_btnSplitHelp = MakeButton(hwnd, L"?", S(kPad + 40 + 180 + 6), S(166), S(20), S(20),
+                                    BtnStyle::Help, (HMENU)IDC_BTN_SPLITHELP, g_fBody, dpi);
+        if (HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                       WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                       CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                       hwnd, nullptr, hInst, nullptr)) {
+            TTTOOLINFOW ti = { sizeof(ti) };
+            ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            ti.hwnd = hwnd;
+            ti.uId = (UINT_PTR)g_btnSplitHelp;
+            ti.lpszText = (LPWSTR)L"How to merge split parts";
+            SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
 
         // Default on (the driver is the primary method); --no-driver clears it.
         g_chkDriver = CreateWindowExW(0, L"BUTTON", L"Use WinPmem driver (recommended)",
@@ -2243,6 +2335,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             return 0;
         }
+        case IDC_BTN_SPLITHELP: OnSplitHelp(); return 0;
         case IDC_CHK_DRIVER:
             // Just reflect the checkbox into g_driverMode; OnCapture is the only
             // consumer and it re-reads this each time.
@@ -2444,7 +2537,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_PROGRESS_CLASS;
+    icc.dwICC = ICC_PROGRESS_CLASS | ICC_BAR_CLASSES;   // progress bar, tooltips
     InitCommonControlsEx(&icc);
 
     CreateThemeGfx();
