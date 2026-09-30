@@ -77,6 +77,10 @@
 #define IDC_SUB_SECOND   2003
 #define IDC_SUB_OK       2004
 
+// System-menu command (title-bar icon menu). Must be below 0xF000 with the low
+// four bits clear, as Windows uses those bits in WM_SYSCOMMAND.
+#define IDM_ABOUT        0x0010
+
 #define WM_APP_PROGRESS (WM_APP + 1)   // wParam = percent, lParam = bytes done in this phase
 #define WM_APP_FINISHED (WM_APP + 2)
 #define WM_APP_PHASE    (WM_APP + 3)   // wParam = CapturePhase, lParam = expected total bytes (0 = unknown)
@@ -139,6 +143,7 @@ static const int kCol2    = 268;  // x of the second column (Host/OS, driver che
 static const int kBrowseW = 80;   // Browse button width
 static const int kFooterY = 290;  // top of the footer strip
 static HICON  g_hIcon = nullptr;
+static HICON  g_hIconAbout = nullptr;   // larger icon for the About dialog (loaded on first use)
 
 static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
@@ -1345,7 +1350,8 @@ static HWND MakeButton(HWND parent, const wchar_t* text, int x, int y, int w, in
 //  Sub windows (legal docs, notes, result) - themed, modal
 // ---------------------------------------------------------------------------
 struct SubSpec {
-    int         kind;     // 0 = doc/note (one button), 1 = result (up to two buttons)
+    int         kind;     // 0 = doc/note (one button), 1 = result (up to two buttons),
+                          // kSubAbout = About dialog (painted content, no text box)
     std::wstring title;
     std::wstring body;
     std::wstring primaryBtn;   // right button
@@ -1393,20 +1399,69 @@ static void CloseSubWindow(HWND hwnd) {
     DestroyWindow(hwnd);
 }
 
+static const int kSubAbout = 2;
+
+// About dialog content (kind == kSubAbout), painted into the sub window:
+// dark header band with icon, name and version, then description, credits
+// and project link. The Close button is a normal owner-drawn child.
+static void DrawAbout(HDC dc, const RECT& rc, int dpi) {
+    auto S = [dpi](int v) { return Sc(v, dpi); };
+    int W = rc.right;
+    SetBkMode(dc, TRANSPARENT);
+    auto text = [&](const std::wstring& s, RECT r, HFONT f, COLORREF col, UINT fmt) {
+        HFONT of = (HFONT)SelectObject(dc, f);
+        SetTextColor(dc, col);
+        DrawTextW(dc, s.c_str(), -1, &r, fmt | DT_NOPREFIX);
+        SelectObject(dc, of);
+    };
+
+    RECT hr = { 0, 0, W, S(76) };
+    FillRect(dc, &hr, g_brHeader);
+    if (!g_hIconAbout)
+        g_hIconAbout = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_RAMSTAIN),
+                                         IMAGE_ICON, S(40), S(40), 0);
+    if (g_hIconAbout)
+        DrawIconEx(dc, S(20), S(18), g_hIconAbout, S(40), S(40), 0, nullptr, DI_NORMAL);
+    text(L"RAMstain", { S(72), S(14), W - S(20), S(40) }, g_fTitle, C.white,
+         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(std::wstring(L"Version ") + kVersionStr + L"  ·  Physical Memory Capture",
+         { S(72), S(40), W - S(20), S(60) }, g_fFoot, C.headerSub,
+         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    int y = S(92);
+    text(L"Offline physical memory capture for Windows, for forensics and incident "
+         L"response. No account, no network, nothing is sent anywhere.",
+         { S(20), y, W - S(20), y + S(40) }, g_fSmall, C.text, DT_LEFT | DT_WORDBREAK);
+
+    y = S(142);
+    text(L"CAPTURE ENGINE", { S(20), y, W - S(20), y + S(14) }, g_fLabel, C.label,
+         DT_LEFT | DT_SINGLELINE);
+    text(L"WinPmem 2.0.1 by Michael Cohen, maintained by Velocidex. Signed kernel "
+         L"driver, used under the Apache License 2.0.",
+         { S(20), y + S(16), W - S(20), y + S(52) }, g_fSmall, C.text, DT_LEFT | DT_WORDBREAK);
+
+    y = S(206);
+    text(L"PROJECT", { S(20), y, W - S(20), y + S(14) }, g_fLabel, C.label,
+         DT_LEFT | DT_SINGLELINE);
+    text(L"github.com/alternat0r/RAMStain", { S(20), y + S(16), W - S(20), y + S(34) },
+         g_fSmall, C.accent, DT_LEFT | DT_SINGLELINE);
+}
+
 static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         int dpi = GetDpiForWindow(hwnd);
         int W = g_subSpec.w, H = g_subSpec.h;
 
-        HWND edit = CreateWindowExW(0, L"EDIT", g_subSpec.body.c_str(),
+        HWND edit = (g_subSpec.kind == kSubAbout) ? nullptr :
+                    CreateWindowExW(0, L"EDIT", g_subSpec.body.c_str(),
                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
                                     Sc(16, dpi), Sc(16, dpi), W - Sc(32, dpi),
                                     H - Sc(16, dpi) - Sc(72, dpi),
                                     hwnd, (HMENU)IDC_SUB_TEXT, GetModuleHandleW(nullptr), nullptr);
-        // Normal weight: g_fBody is semibold, which made whole documents bold.
-        SendMessageW(edit, WM_SETFONT, (WPARAM)g_fText, TRUE);
-        {
+        if (edit) {
+            // Normal weight: g_fBody is semibold, which made whole documents bold.
+            SendMessageW(edit, WM_SETFONT, (WPARAM)g_fText, TRUE);
             // Inner padding so text does not touch the border.
             RECT tr;
             GetClientRect(edit, &tr);
@@ -1446,6 +1501,8 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
         HBITMAP oldb = (HBITMAP)SelectObject(mem, bmp);
         FillRect(mem, &rc, g_brBg);
+        if (g_subSpec.kind == kSubAbout)
+            DrawAbout(mem, rc, dpi);
         // rounded border around the text edit
         HWND edit = GetDlgItem(hwnd, IDC_SUB_TEXT);
         if (edit) {
@@ -1568,6 +1625,13 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
         PostMessageW(g_hwnd, WM_APP_FINISHED, 0, 0);
     }
     return g_subResult;
+}
+
+// About dialog, opened from the title-bar icon (system) menu.
+static void ShowAbout() {
+    int dpi = g_hwnd ? GetDpiForWindow(g_hwnd) : 96;
+    ShowSubWindow(kSubAbout, L"About RAMstain", L"", L"Close", L"", L"",
+                  Sc(440, dpi), Sc(316, dpi));
 }
 
 // ---------------------------------------------------------------------------
@@ -2117,10 +2181,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, S(24), S(24), 0);
 
+        // "About RAMstain..." at the bottom of the title-bar icon menu.
+        if (HMENU sys = GetSystemMenu(hwnd, FALSE)) {
+            AppendMenuW(sys, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(sys, MF_STRING, IDM_ABOUT, L"About RAMstain...");
+        }
+
         g_status = L"Ready.";
         g_statusColor = C.muted;
         return 0;
     }
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == IDM_ABOUT) {
+            ShowAbout();
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_CTLCOLORSTATIC:
         // Checkboxes sit on the grey body background, not on white boxes.
         if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver) {
@@ -2310,6 +2386,7 @@ static void DestroyThemeGfx() {
     for (HFONT f : { g_fTitle, g_fBody, g_fLabel, g_fSmall, g_fEdit, g_fText, g_fFoot })
         if (f) DeleteObject(f);
     if (g_hIcon) DestroyIcon(g_hIcon);
+    if (g_hIconAbout) DestroyIcon(g_hIconAbout);
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
