@@ -6,6 +6,10 @@ response.
 No account, no email, no registration, no network. One portable EXE: run it,
 pick where to save, click **Capture**.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="RAMstain main window" width="536">
+</p>
+
 ---
 
 ## Features
