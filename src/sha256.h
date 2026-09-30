@@ -1,6 +1,6 @@
 // SHA-256 via Windows CNG (bcrypt.dll, part of Windows since Vista) - no
 // third-party code, and CNG uses the CPU's SHA extensions where available.
-// Same interface as md5.h: Update(), Hex() (finalizes), Reset().
+// Interface: Update(), Hex() (finalizes), Reset().
 #pragma once
 #include <windows.h>
 #include <bcrypt.h>

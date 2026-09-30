@@ -20,7 +20,7 @@ hand, often under time pressure.
 
 RAMstain puts a simple window on top of WinPmem, so a capture is **point and
 click**: choose where to save, click **Capture**, and get the image, its
-MD5 and SHA-256 hashes, and a ready-made evidence note (`.meta`) in one go. The goal is to save
+SHA-256 hash, and a ready-made evidence note (`.meta`) in one go. The goal is to save
 forensic analysts time and avoid mistakes, not to replace WinPmem.
 
 ---
@@ -31,11 +31,14 @@ forensic analysts time and avoid mistakes, not to replace WinPmem.
   signed [WinPmem](#credits) imager is built in.
 - **Offline.** No network calls, no telemetry, no updates.
 - **Evidence-ready output.** A `.raw` image plus a `.meta` sidecar with host,
-  OS, timestamp, size, MD5 and SHA-256.
+  OS, timestamp, size and SHA-256.
 - **Split images** into 1–16 GB parts (`.001`, `.002`, …), including a
   FAT32-safe 4 GB option.
 - **Live progress** for the capture and the hashing step, with **Stop** at any
   time (the partial image is kept).
+- **Pagefile / hibernation file collection:** optionally collect
+  `pagefile.sys` and `hiberfil.sys` alongside the memory image, each with its
+  own SHA-256 and `.meta` sidecar.
 - **Safety checks:** overwrite prompt, free-space check, and a warning if you
   close the window during a capture.
 
@@ -43,7 +46,7 @@ forensic analysts time and avoid mistakes, not to replace WinPmem.
 
 Run `RAMstain.exe` (it asks for Administrator rights), choose the output path,
 and click **Capture**. When it finishes you get a summary with size, time,
-speed, MD5 and SHA-256.
+speed and SHA-256.
 
 ### Keyboard
 
@@ -57,8 +60,10 @@ with **Alt**:
 | Alt+O / Alt+S | Close / Stop (during a capture) |
 | Alt+T | Save-to path field |
 | Alt+B | Browse… |
-| Alt+P | Split drop-down |
+| Alt+L | Split drop-down |
 | Alt+D | Use WinPmem driver |
+| Alt+P | Also collect pagefile.sys |
+| Alt+H | Also collect hiberfil.sys |
 | Alt+A | Always on top |
 | Alt+I / Alt+V / Alt+U | Disclaimer / Privacy Policy / Terms of Use |
 | F1 | About |
@@ -73,6 +78,9 @@ RAMstain.exe "D:\evidence\host1.raw"      pre-fill the save path
 RAMstain.exe --split 4095                 preselect split size in MB
 RAMstain.exe --driver "C:\tools\winpmem.exe"   use an external imager instead of the built-in one
 RAMstain.exe --no-driver                  select the experimental driverless method
+RAMstain.exe --pagefile                   also collect pagefile.sys
+RAMstain.exe --hiberfil                   also collect hiberfil.sys
+RAMstain.exe --system-files               also collect both pagefile and hibernation file
 RAMstain.exe --selftest "C:\out\test.raw" 512 MB synthetic test, no real memory read
 ```
 
@@ -84,7 +92,9 @@ variable. Both the classic WinPmem 2.x and the Go imager (`go-winpmem`) work.
 | File | Contents |
 |------|----------|
 | `<name>.raw` | Physical memory image. With splitting: `<name>.001`, `<name>.002`, … |
-| `<name>.meta` | Image path, host, OS/kernel, capture start and finish (UTC and local), size, MD5, SHA-256, tool version, method, and per-part hashes when split. |
+| `<name>.meta` | Image path, host, OS/kernel, capture start and finish (UTC and local), size, SHA-256, tool version, method, and per-part hashes when split. |
+| `<name>__pagefile.raw` + `.meta` | Collected pagefile (if requested), with its own size, SHA-256 and source path. |
+| `<name>__hiberfil.raw` + `.meta` | Collected hibernation file (if requested), same sidecar format. |
 
 Example `host1.meta`:
 
@@ -99,14 +109,13 @@ Started:     2026-09-28T08:36:14Z  (local 2026-09-28 16:36:14 UTC+08:00)
 Finished:    2026-09-28T08:42:51Z  (local 2026-09-28 16:42:51 UTC+08:00)
 Size:        34359738368 bytes
 Pages:       8388608 x 4096 bytes
-MD5:         2ea471360b0e7eecd12e9f61a5d2649c
 SHA-256:     adc0a545e4ddbfc76f87b9eca80d0ab066bf9f9dd1f8390e1306f85a7bbf84fa
 Tool:        RAMstain 1.9.0
 Method:      WinPmem kernel driver (WinPmem 2.x, embedded, Velocidex signed driver)
 ```
 
-Both hashes are computed in one pass over the image. A stopped capture keeps
-its partial image but gets no hashes.
+The hash is computed in one pass over the image. A stopped capture keeps
+its partial image but gets no hash.
 
 ## Splitting large images
 
@@ -115,8 +124,8 @@ use the `.001`, `.002`, … naming that FTK Imager, X-Ways and Autopsy open
 directly. Choose **4 GB parts (FAT32-safe)** for FAT32 USB drives.
 
 The image is split in place after capture, so the extra disk space needed is
-only one part. The `.meta` file lists each part with its own MD5 and SHA-256; the
-main hashes cover the whole image. To rejoin:
+only one part. The `.meta` file lists each part with its own SHA-256; the
+main hash covers the whole image. To rejoin:
 
 ```
 copy /b host1.001 + host1.002 + host1.003 host1.raw
@@ -126,6 +135,23 @@ List the parts explicitly: `copy /b host1.0*` can join them in the wrong order
 on FAT32/exFAT drives. The **?** button next to the Split drop-down shows these
 steps in the app, including a PowerShell one-liner for many parts and the
 Linux/macOS `cat` command.
+
+## Collecting the pagefile and hibernation file
+
+Tick **Pagefile** and/or **Hibernation file** in the **Also** row (or pass
+`--pagefile` / `--hiberfil` / `--system-files`) to copy `pagefile.sys` and
+`hiberfil.sys` to the same folder as the memory image, right after the capture.
+
+- No kernel driver is needed: these files are locked by the OS, but an
+  Administrator can read them with full sharing. RAMstain copies them in one
+  pass, computing SHA-256 at the same time.
+- The pagefile is located from the system's `PagefileList` setting (it may live
+  on any volume); the hibernation file from the system volume. If a file does
+  not exist — the pagefile or hibernation is disabled — the run notes it and
+  writes a `.meta` sidecar recording that nothing was collected.
+- Collection is independent of the memory capture: a pagefile/hibernation file
+  is still collected (and reported) even if the memory image itself fails or is
+  stopped. Stopping during collection discards the partial system file.
 
 ## How it captures
 

@@ -3,7 +3,7 @@
 //
 //  Captures physical RAM via the signed Velocidex WinPmem imager (default):
 //  the imager loads its signed kernel driver, writes the image, and unloads.
-//  RAMstain adds MD5 + SHA-256 and the .meta evidence sidecar. No registration, no
+//  RAMstain adds SHA-256 and the .meta evidence sidecar. No registration, no
 //  account, no network. Offline by design.
 //
 //  An experimental driverless path (OpenProcess(PID -1) + ReadProcessMemory)
@@ -13,7 +13,7 @@
 //
 //  Output:
 //    <name>.raw   physical memory image, 4 KiB page-aligned
-//    <name>.meta  capture metadata (host, OS, kernel, size, MD5, SHA-256)
+//    <name>.meta  capture metadata (host, OS, kernel, size, SHA-256)
 //
 //  UI: modern flat theme (dark header band, cards, rounded owner-drawn
 //      buttons, themed progress bar), Disclaimer / Privacy / Terms dialogs.
@@ -22,6 +22,9 @@
 //    RAMstain.exe ["C:\path\to\dump.raw"]     pre-fill the save path
 //    RAMstain.exe --driver <imager.exe>       use an explicit WinPmem imager
 //    RAMstain.exe --no-driver                 start with the driverless path selected
+//    RAMstain.exe --pagefile                  also collect pagefile.sys
+//    RAMstain.exe --hiberfil                  also collect hiberfil.sys
+//    RAMstain.exe --system-files              collect both pagefile and hibernation file
 //    RAMstain.exe --selftest ["C:\path\out"]  synthetic 512 MiB pipeline test
 //
 //  Build: MSVC (Visual Studio 2022), x64, static CRT
@@ -43,7 +46,6 @@
 #include <map>
 #include <cstdio>
 #include <cstdint>
-#include "md5.h"
 #include "sha256.h"
 #include "legal.h"
 #include "resource.h"
@@ -73,6 +75,8 @@
 #define IDC_CHK_DRIVER   1010
 #define IDC_CMB_SPLIT    1011
 #define IDC_BTN_SPLITHELP 1012
+#define IDC_CHK_PAGEFILE 1013
+#define IDC_CHK_HIBERFIL 1014
 
 #define IDC_SUB_TEXT     2001
 #define IDC_SUB_PRIMARY  2002
@@ -87,7 +91,7 @@
 #define WM_APP_FINISHED (WM_APP + 2)
 #define WM_APP_PHASE    (WM_APP + 3)   // wParam = CapturePhase, lParam = expected total bytes (0 = unknown)
 
-enum class CapturePhase { Capturing = 0, Hashing = 1, Splitting = 2 };
+enum class CapturePhase { Capturing = 0, Hashing = 1, Splitting = 2, Collecting = 3 };
 
 static const wchar_t* kWindowClass = L"RAMstain.MainWindow";
 static const wchar_t* kSubClass    = L"RAMstain.SubWindow";
@@ -138,19 +142,20 @@ static HFONT  g_fFoot = nullptr;  // header subtitle / footer text
 
 // Main window layout, in 96-dpi pixels (scaled with Sc()). Client area is
 // kDesignW x kDesignH; see DrawMain and WM_CREATE for the rows.
-static const int kDesignW = 520, kDesignH = 318;
+static const int kDesignW = 520, kDesignH = 346;
 static const int kPad     = 16;   // outer margin
 static const int kHeaderH = 48;   // dark header band
 static const int kCol2    = 268;  // x of the second column (Host/OS, driver checkbox)
 static const int kBrowseW = 80;   // Browse button width
-static const int kFooterY = 290;  // top of the footer strip
+static const int kFooterY = 318;  // top of the footer strip
 static HICON  g_hIcon = nullptr;
 static HICON  g_hIconAbout = nullptr;   // larger icon for the About dialog (loaded on first use)
 
 static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
               g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit,
-              g_btnSplitHelp, g_lblSave, g_lblSplit;
+              g_btnSplitHelp, g_lblSave, g_lblSplit, g_lblCollect,
+              g_chkPagefile, g_chkHiberfil;
 static HWND   g_lastFocus = nullptr;    // control to refocus when the window is reactivated
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
@@ -165,6 +170,12 @@ static std::wstring g_driverPath;    // explicit imager path from --driver <path
 static std::wstring g_cliPath;
 static UINT64 g_splitBytes = 0;      // part size for this capture (0 = no split); set in OnCapture
 static UINT   g_cliSplitMB = 0;      // --split <MB> from the command line (0 = not given)
+// "Also collect" options for this run (resolved from the checkboxes / CLI in
+// OnCapture; g_cliCollect* is the command-line preselect for the checkboxes).
+static bool   g_collectPagefile = false;
+static bool   g_collectHiberfil = false;
+static bool   g_cliCollectPagefile = false;
+static bool   g_cliCollectHiberfil = false;
 
 static std::wstring g_status;        // status line text
 static COLORREF     g_statusColor;   // status line color
@@ -179,8 +190,21 @@ static std::map<HWND, BtnState> g_btns;
 struct SplitPart {
     std::wstring path;
     UINT64       bytes = 0;
-    std::string  md5;                // empty when no hashes were computed
-    std::string  sha256;
+    std::string  sha256;             // empty when no hashes were computed
+};
+
+// One system file collected alongside the memory image (pagefile.sys or
+// hiberfil.sys), copied in full with a single hash pass.
+struct SysFileCapture {
+    std::wstring kind;               // "pagefile" or "hiberfil"
+    std::wstring source;             // location found on this system (empty if not present)
+    std::wstring path;               // the collected copy (empty if not collected)
+    UINT64       bytes = 0;
+    std::string  sha256;             // empty when no hash was computed
+    FILETIME     startUtc = {};      // collection start (UTC)
+    FILETIME     endUtc = {};        // collection end (UTC)
+    std::wstring metaPath;           // <path>.meta sidecar (empty if not written)
+    std::wstring error;              // user-facing note when collection failed (empty on success)
 };
 
 struct CaptureResult {
@@ -194,22 +218,20 @@ struct CaptureResult {
     std::wstring error;              // user-facing (empty on success)
     FILETIME     startUtc = {};      // capture start (UTC)
     FILETIME     endUtc = {};        // image data complete, before hashing/splitting (UTC)
-    std::string  md5;                // whole image; empty when not computed
-    std::string  sha256;
+    std::string  sha256;             // whole image; empty when not computed
     std::wstring path;
     std::wstring metaPath;
     std::wstring method;             // "WinPmem kernel driver ..." (empty = driverless path)
-    std::vector<std::string> partMd5;    // per g_splitBytes slice, filled while hashing
-    std::vector<std::string> partSha256;
+    std::vector<std::string> partSha256;  // per g_splitBytes slice, filled while hashing
     std::vector<SplitPart>   parts;  // non-empty once the image has been split
     std::wstring splitError;         // split failed part-way (image data still intact)
+    std::vector<SysFileCapture> sysfiles;  // pagefile / hibernation files collected alongside
 };
 
-// MD5 + SHA-256 of the same byte stream, fed in one pass.
+// SHA-256 of a byte stream, fed in one pass.
 struct ImageHash {
-    MD5 md5;
     SHA256 sha256;
-    void Update(const BYTE* p, size_t n) { md5.Update(p, n); sha256.Update(p, n); }
+    void Update(const BYTE* p, size_t n) { sha256.Update(p, n); }
 };
 
 // Hashes of consecutive fixed-size slices of a byte stream, computed alongside
@@ -218,7 +240,7 @@ struct ImageHash {
 struct PartHasher {
     UINT64 partSize = 0, inPart = 0;
     ImageHash cur;
-    std::vector<std::string> md5s, sha256s;
+    std::vector<std::string> sha256s;
     explicit PartHasher(UINT64 ps) : partSize(ps) {}
     void Update(const BYTE* p, size_t n) {
         if (!partSize) return;
@@ -232,14 +254,11 @@ struct PartHasher {
     // Call once at the end; moves the results into res.
     void Finish(struct CaptureResult* res) {
         if (partSize && inPart > 0) Close();
-        res->partMd5 = std::move(md5s);
         res->partSha256 = std::move(sha256s);
     }
 private:
     void Close() {
-        md5s.push_back(cur.md5.Hex());
         sha256s.push_back(cur.sha256.Hex());
-        cur.md5.Reset();
         cur.sha256.Reset();
         inPart = 0;
     }
@@ -447,7 +466,7 @@ static std::wstring FormatUtcAndLocal(FILETIME ft) {
     return buf;
 }
 
-// A whole-image hash (res->md5 / res->sha256) as shown in the .meta sidecar
+// A whole-image hash (res->sha256) as shown in the .meta sidecar
 // and the completion dialog.
 static std::wstring HashText(const CaptureResult* res, const std::string& hash) {
     if (!hash.empty()) return Utf8ToWide(hash);
@@ -493,7 +512,6 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
             partsBlock += L"Part " + std::wstring(num) + L":    " +
                           p.path.substr(p.path.find_last_of(L"\\/") + 1) + L"  " +
                           std::to_wstring(p.bytes) + L" bytes\n" +
-                          L"  MD5:       " + h(p.md5) + L"\n" +
                           L"  SHA-256:   " + h(p.sha256) + L"\n";
         }
     }
@@ -511,7 +529,6 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
         L"Finished:    " + FormatUtcAndLocal(res->endUtc) + L"\n" +
         L"Size:        " + std::to_wstring(res->bytesWritten) + L" bytes\n" +
         L"Pages:       " + std::to_wstring(res->pagesWritten) + L" x 4096 bytes\n" +
-        L"MD5:         " + HashText(res, res->md5) + L"\n" +
         L"SHA-256:     " + HashText(res, res->sha256) + L"\n" +
         L"Tool:        RAMstain " + kVersionStr + L"\n" +
         L"Method:      " + (selftest
@@ -641,9 +658,8 @@ static void SplitImage(CaptureResult* res) {
         return;
     }
     parts[0] = SplitPart{ first, ps, "" };
-    if (res->partMd5.size() == parts.size() && res->partSha256.size() == parts.size())
+    if (res->partSha256.size() == parts.size())
         for (size_t i = 0; i < parts.size(); ++i) {
-            parts[i].md5 = res->partMd5[i];
             parts[i].sha256 = res->partSha256[i];
         }
     res->parts = std::move(parts);
@@ -725,7 +741,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 
     // Metadata is written via the shared sidecar writer (WriteMetaSidecar).
 
-    ImageHash hash;                      // MD5 + SHA-256 while streaming
+    ImageHash hash;                      // SHA-256 while streaming
     PartHasher partHash(g_splitBytes);   // per-part hashes if the image will be split
     std::vector<BYTE> buf(kChunkBytes);
     PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)CapturePhase::Capturing, (LPARAM)neededBytes);
@@ -788,7 +804,6 @@ static void RunCapture(CaptureResult* res, bool selftest) {
     res->ok = res->bytesWritten > 0;
     // A user-stopped (partial) image gets no hashes, same as the driver path.
     if (!res->cancelled) {
-        res->md5 = hash.md5.Hex();
         res->sha256 = hash.sha256.Hex();
         partHash.Finish(res);
     }
@@ -801,7 +816,7 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 //  WinPmem driver capture (the default method).
 //
 //  Runs the signed Velocidex WinPmem imager, which loads its own signed kernel
-//  driver, writes the .raw image, then unloads it. We compute MD5 + SHA-256 over the
+//  driver, writes the .raw image, then unloads it. We compute SHA-256 over the
 //  resulting file and write the same .meta sidecar as the driverless path.
 //
 //  The imager is embedded in RAMstain.exe (IDR_WINPMEM, third_party/winpmem/).
@@ -1019,8 +1034,8 @@ static void PostPhase(CapturePhase phase, UINT64 totalBytes) {
     PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)phase, (LPARAM)totalBytes);
 }
 
-// Compute the MD5 and SHA-256 of a completed image in one pass into res->md5 /
-// res->sha256 (no-op if the file is missing). Only called for images that were
+// Compute the SHA-256 of a completed image in one pass into res->sha256
+// (no-op if the file is missing). Only called for images that were
 // not stopped mid-capture. If the user presses Stop while hashing, the hashes
 // are abandoned (left empty, res->hashStopped set) - a hash cut short must
 // never be recorded.
@@ -1034,7 +1049,7 @@ static void HashFile(CaptureResult* res) {
     PostPhase(CapturePhase::Hashing, total);
     PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, 0);
 
-    ImageHash hash;                      // MD5 + SHA-256
+    ImageHash hash;                      // SHA-256
     PartHasher partHash(g_splitBytes);   // per-part hashes in the same pass
     std::vector<BYTE> buf(4 * 1024 * 1024);
     UINT64 done = 0, lastPosted = 0;
@@ -1056,10 +1071,257 @@ static void HashFile(CaptureResult* res) {
             PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)(pct > 100 ? 100 : pct), (LPARAM)done);
         }
     }
-    res->md5 = hash.md5.Hex();
     res->sha256 = hash.sha256.Hex();
     partHash.Finish(res);
     CloseHandle(hf);
+}
+
+// ---------------------------------------------------------------------------
+//  System file collection (pagefile.sys / hiberfil.sys)
+//
+//  These live on the system volume, are locked by the OS for the whole
+//  session, and can be read by an Administrator with generous share flags -
+//  no kernel driver is needed. Each one is copied in full to a file next to
+//  the memory image, hashing in a single pass. Independent of the memory
+//  capture itself, so a pagefile/hibernation file is still collected even if
+//  the memory image fails (the .meta sidecar says so).
+// ---------------------------------------------------------------------------
+
+// Volume root of the system volume, e.g. "C:\\". GetWindowsDirectoryW may
+// point inside a subfolder (C:\Windows, C:\WIN, D:\Win, ...), so only the
+// drive prefix is the volume root that holds pagefile.sys / hiberfil.sys.
+static std::wstring GetSystemVolume() {
+    wchar_t sysroot[MAX_PATH] = L"";
+    DWORD n = GetWindowsDirectoryW(sysroot, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH || n < 3) return L"";
+    return std::wstring(sysroot, 3);   // "C:\" + the backslash
+}
+
+// Full paths of every pagefile the system uses, from the registry
+// (HKLM\...\Session Manager\Memory Management\PagefileList), else none.
+static std::vector<std::wstring> GetPagefilePaths() {
+    std::vector<std::wstring> out;
+    LSTATUS st = ERROR_SUCCESS;
+    char value[512] = {0};
+    DWORD cb = sizeof(value);
+    st = RegQueryValueExA(HKEY_LOCAL_MACHINE,
+                         "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+                         nullptr, nullptr, (LPBYTE)value, &cb);
+    if (st == ERROR_SUCCESS && cb > 1) {
+        std::string v(value, cb - 1);  // strip the terminating NUL
+        size_t i = 0;
+        while (i < v.size()) {
+            while (i < v.size() && v[i] == ',') ++i;
+            size_t e = v.find(',', i);
+            if (e == std::string::npos) e = v.size();
+            if (e > i) {
+                std::wstring p = Utf8ToWide(v.substr(i, e - i));
+                TrimRight(p);
+                if (!p.empty()) out.push_back(p);
+            }
+            i = e;
+        }
+    }
+    // PagefileList empty/absent (system-managed default) => <system volume>\pagefile.sys.
+    if (out.empty()) {
+        std::wstring sv = GetSystemVolume();
+        if (!sv.empty()) out.push_back(sv + L"pagefile.sys");
+    }
+    return out;
+}
+
+// Where the hibernation file is. In standard Windows it is always on the
+// boot/system volume (the volume that holds Windows); there is no documented
+// per-volume override, so the system volume is the authoritative location.
+static std::wstring GetHiberfilPath() {
+    std::wstring sv = GetSystemVolume();
+    return sv.empty() ? std::wstring() : sv + L"hiberfil.sys";
+}
+
+static bool FilePresent(const std::wstring& p) {
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// The .meta sidecar for one requested system file (written on every outcome -
+// success, partial, or "not found" - so the record exists either way).
+// metaPath is passed explicitly; the "Collected:" line is empty->"(not collected)".
+// memComplete / memPartial describe the memory image state at collection time.
+static void WriteSysFileMeta(const SysFileCapture& sf, const std::wstring& metaPath,
+                             bool memComplete, bool memPartial) {
+    if (metaPath.empty()) return;
+    std::wstring host = GetComputerName();
+    std::wstring os = GetOsVersionString();
+    std::wstring label = (sf.kind == L"pagefile") ? L"pagefile.sys" : L"hiberfil.sys";
+    auto ht = [](const std::string& h) { return h.empty() ? std::wstring(L"not computed") : Utf8ToWide(h); };
+    std::wstring m;
+    m += L"RAMstain system file metadata\n";
+    m += L"=============================\n";
+    m += L"File:        ";  m += label;  m += L"\n";
+    m += L"Source:      ";  m += (sf.source.empty() ? L"not found on this system" : sf.source);  m += L"\n";
+    m += L"Collected:   ";  m += (sf.path.empty() ? L"(not collected)" : sf.path);  m += L"\n";
+    m += L"Host:        ";  m += host;  m += L"\n";
+    m += L"OS:          ";  m += os;  m += L"\n";
+    m += L"Started:     ";  m += FormatUtcAndLocal(sf.startUtc);  m += L"\n";
+    m += L"Finished:    ";  m += FormatUtcAndLocal(sf.endUtc);  m += L"\n";
+    m += L"Size:        ";  m += std::to_wstring(sf.bytes);  m += L" bytes\n";
+    m += L"SHA-256:     ";  m += ht(sf.sha256);  m += L"\n";
+    m += L"Method:      Locked-file copy (Administrator, full read sharing)\n";
+    m += L"Note:        ";
+    if (memComplete)
+        m += L"Collected alongside the RAMstain memory image.\n";
+    else if (memPartial)
+        m += L"The memory image was stopped by the user (partial); this system file is complete and valid on its own.\n";
+    else
+        m += L"The memory image was not captured; this system file is complete and valid on its own.\n";
+    if (!sf.error.empty()) { m += L"Note:        "; m += sf.error; m += L"\n"; }
+    std::string u = WideToUtf8(m);
+    HANDLE h = CreateFileW(metaPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        WriteFile(h, u.data(), (DWORD)u.size(), &wr, nullptr);
+        CloseHandle(h);
+    }
+}
+
+// Copy one source file to dst, hashing in the same pass. Returns true when the
+// whole file was copied. On a partial/failed copy, dst is removed and
+// sf.error is set; on success sf.path/sha256/bytes/timestamps are filled.
+static bool CopySystemFile(const std::wstring& src, const std::wstring& dst, SysFileCapture& sf) {
+    // Open with the widest sharing so a file locked by the OS is still readable.
+    HANDLE hIn = CreateFileW(src.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hIn == INVALID_HANDLE_VALUE) {
+        sf.error = L"could not open " + src + L" (error " + std::to_wstring(GetLastError()) + L").";
+        return false;
+    }
+    LARGE_INTEGER sz = {0};
+    GetFileSizeEx(hIn, &sz);
+    sf.bytes = (UINT64)sz.QuadPart;
+    sf.source = src;
+
+    DeleteFileW(dst.c_str());  // replace a stale copy; overwrite was confirmed
+    HANDLE hOut = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (hOut == INVALID_HANDLE_VALUE) {
+        CloseHandle(hIn);
+        sf.error = L"could not create " + dst + L" (error " + std::to_wstring(GetLastError()) + L").";
+        return false;
+    }
+
+    ImageHash hash;
+    std::vector<BYTE> buf(4 * 1024 * 1024);
+    UINT64 done = 0, lastPosted = 0;
+    double totalDouble = sf.bytes > 0 ? (double)sf.bytes : 1.0;
+    bool ok = true;
+    GetSystemTimeAsFileTime(&sf.startUtc);
+    for (;;) {
+        if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) { ok = false; break; }
+        if (sf.bytes > 0 && done >= sf.bytes) break;
+        DWORD want = (DWORD)min((UINT64)buf.size(), sf.bytes - done);
+        LARGE_INTEGER li; li.QuadPart = (LONGLONG)done;
+        SetFilePointerEx(hIn, li, nullptr, FILE_BEGIN);
+        DWORD rd = 0;
+        if (!ReadFile(hIn, buf.data(), want, &rd, nullptr) || rd == 0) {
+            if (!(sf.bytes > 0 && done < sf.bytes)) ok = false;  // expected EOF at the end is fine
+            break;
+        }
+        hash.Update(buf.data(), rd);
+        LARGE_INTEGER liOut; liOut.QuadPart = (LONGLONG)done;
+        if (!SetFilePointerEx(hOut, liOut, nullptr, FILE_BEGIN) ||
+            !WriteFile(hOut, buf.data(), rd, nullptr, nullptr)) { ok = false; break; }
+        done += rd;
+        if (done - lastPosted >= 64ull * 1024 * 1024) {
+            lastPosted = done;
+            PostMessageW(g_hwnd, WM_APP_PROGRESS,
+                         (WPARAM)(int)((double)done / totalDouble * 100.0),
+                         (LPARAM)done);
+        }
+    }
+    GetSystemTimeAsFileTime(&sf.endUtc);
+    if (ok && sf.bytes > 0 && done < sf.bytes) {
+        ok = false;
+        sf.error = L"source file shrank or changed while being read (copied " +
+                   std::to_wstring(done) + L" of " + std::to_wstring(sf.bytes) + L" bytes).";
+    }
+    sf.bytes = done;
+    if (ok) {
+        sf.sha256 = hash.sha256.Hex();
+        sf.path = dst;
+    } else if (sf.error.empty()) {
+        sf.error = L"collection stopped by user (partial copy discarded).";
+    }
+    if (ok) FlushFileBuffers(hOut);
+    CloseHandle(hOut);
+    if (!ok) DeleteFileW(dst.c_str());  // after the handle is closed, or the OS refuses
+    CloseHandle(hIn);
+    return ok;
+}
+
+// Collect one requested system file (pagefile or hiberfil) into res->sysfiles.
+// A .meta sidecar is written for every outcome so the record always exists.
+static void CollectSystemFile(CaptureResult* res, bool pagefile) {
+    SysFileCapture sf;
+    sf.kind = pagefile ? L"pagefile" : L"hiberfil";
+    std::wstring base = res->path;
+    StripExtensionInPlace(base);
+    std::wstring dst = base + (pagefile ? L"__pagefile.raw" : L"__hiberfil.raw");
+
+    // Memory-image state at collection time, for the sidecar's note.
+    bool memComplete = res->ok && !res->cancelled;          // full image written (hashes optional)
+    bool memPartial  = res->cancelled && res->bytesWritten > 0;  // stopped mid-capture
+
+    // Find the source.
+    std::vector<std::wstring> sources;
+    if (pagefile) {
+        sources = GetPagefilePaths();
+    } else {
+        std::wstring p = GetHiberfilPath();
+        if (!p.empty()) sources.push_back(p);
+    }
+
+    // Pick the first that exists.
+    std::wstring src;
+    for (const auto& s : sources) if (FilePresent(s)) { src = s; break; }
+
+    if (src.empty()) {
+        sf.error = pagefile
+            ? L"pagefile.sys not found on this system (the pagefile may be disabled). Nothing to collect."
+            : L"hiberfil.sys not found on this system (hibernation may be disabled). Nothing to collect.";
+        if (!sources.empty()) sf.source = sources[0];
+        // Still write a sidecar (next to where the image would go) recording it.
+        std::wstring metaPath = dst;
+        StripExtensionInPlace(metaPath);
+        metaPath += L".meta";
+        WriteSysFileMeta(sf, metaPath, memComplete, memPartial);
+        sf.metaPath = metaPath;
+        res->sysfiles.push_back(sf);
+        return;
+    }
+
+    // (Don't reset the progress bar here: it still shows the memory-capture
+    // percentage, and CopySystemFile posts 0..100 of its own as it copies.)
+    bool ok = CopySystemFile(src, dst, sf);
+    std::wstring metaPath = dst;
+    StripExtensionInPlace(metaPath);
+    metaPath += L".meta";
+    WriteSysFileMeta(sf, metaPath, memComplete, memPartial);
+    if (!sf.path.empty()) sf.metaPath = metaPath;
+    res->sysfiles.push_back(sf);
+}
+
+// Collect the requested pagefile / hibernation file(s) alongside the image.
+// Runs in the worker thread after the memory capture (or in its place).
+static void CollectSystemFiles(CaptureResult* res) {
+    if (!g_collectPagefile && !g_collectHiberfil) return;
+    // Report the phase; total unknown (pagefile size varies), so 0.
+    PostPhase(CapturePhase::Collecting, 0);
+    if (g_collectPagefile) CollectSystemFile(res, true);
+    if (g_collectHiberfil) CollectSystemFile(res, false);
+    PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)100, 0);
 }
 
 // Two different WinPmem imagers ship under similar names, with different CLIs:
@@ -1251,7 +1513,7 @@ static void RunDriverCapture(CaptureResult* res) {
                       L", image may be incomplete";
     }
 
-    // MD5 + SHA-256 over the whole image (plus per-part hashes), then split if requested,
+    // SHA-256 over the whole image (plus per-part hashes), then split if requested,
     // then the .meta sidecar (same documentation as driverless).
     HashFile(res);
     FinishImage(res, false);
@@ -1270,6 +1532,12 @@ static DWORD WINAPI CaptureThreadProc(LPVOID arg) {
         RunDriverCapture(res);          // default: WinPmem signed-driver path
     else
         RunCapture(res, g_selftest);    // experimental driverless path (or synthetic self-test)
+
+    // Collect the requested pagefile / hibernation file(s). Independent of the
+    // memory capture above, so it still runs (and is still useful) if that
+    // capture failed or was stopped.
+    if (!g_selftest)
+        CollectSystemFiles(res);
 
     QueryPerformanceCounter(&t1);
     res->seconds = msPerTick > 0 ? ((double)(t1.QuadPart - t0.QuadPart) * msPerTick) / 1000.0
@@ -1944,15 +2212,16 @@ static void DrawMain(HDC dc, HWND hwnd) {
 
     hline(S(154));
 
-    // Options row: the "Split" label (g_lblSplit), combo and driver checkbox
-    // are all child controls.
+    // Options rows: the "Split" label (g_lblSplit), combo and driver checkbox
+    // (y 164..188), then the "Also" label and pagefile / hibernation checkboxes
+    // (y 192..216) are all child controls.
 
     // Progress percentage (the bar itself is a child control) and status line.
     int pr = g_progress ? (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0) : 0;
-    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(198), W - S(kPad), S(216) },
+    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(226), W - S(kPad), S(244) },
          g_fBody, C.text, DT_RIGHT | DT_VCENTER);
     if (!g_status.empty())
-        text(g_status, { S(kPad), S(218), W - S(kPad), S(236) }, g_fSmall, g_statusColor,
+        text(g_status, { S(kPad), S(246), W - S(kPad), S(264) }, g_fSmall, g_statusColor,
              DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
     // Footer strip: slightly darker band with a top border; links are child
@@ -1979,6 +2248,8 @@ static void SetBusy(bool busy) {
     EnableWindow(g_btnBrowse, !busy);
     EnableWindow(g_btnCapture, !busy);
     EnableWindow(g_cmbSplit, !busy);
+    EnableWindow(g_chkPagefile, !busy);
+    EnableWindow(g_chkHiberfil, !busy);
     // Stop/Close is always clickable when entering either state; OnCloseButton
     // disables it only while a stop is in progress.
     EnableWindow(g_btnClose, TRUE);
@@ -2072,35 +2343,62 @@ static void OnCapture() {
         g_splitBytes = (mb > 0 && mb != CB_ERR) ? (UINT64)mb * 1024 * 1024 : 0;
     }
 
+    // Also-collect options (off during a synthetic self-test).
+    g_collectPagefile = !g_selftest &&
+        (SendMessageW(g_chkPagefile, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    g_collectHiberfil = !g_selftest &&
+        (SendMessageW(g_chkHiberfil, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+    // Size of the requested system files, for the disk-space check below.
+    // (These live on the system volume, but worst-case the target is the same
+    // volume; summing them is a conservative estimate.)
+    UINT64 sysBytes = 0;
+    if (g_collectPagefile)
+        for (const auto& s : GetPagefilePaths()) if (FilePresent(s)) { sysBytes += GetFileBytes(s); break; }
+    if (g_collectHiberfil) {
+        std::wstring hp = GetHiberfilPath();
+        if (!hp.empty() && FilePresent(hp)) sysBytes += GetFileBytes(hp);
+    }
+
     // Confirm overwrite (the single image, or parts from an earlier split capture).
     std::wstring base = path;
     StripExtensionInPlace(base);
     bool imageExists = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
     bool partsExist  = g_splitBytes &&
                        GetFileAttributesW(PartPath(base, 1).c_str()) != INVALID_FILE_ATTRIBUTES;
-    if (imageExists || partsExist) {
-        std::wstring q = imageExists
-            ? L"\"" + path + L"\" already exists.\n\nOverwrite the existing file?"
-            : L"Split parts \"" + PartPath(base, 1) + L"\", ... already exist.\n\n"
-              L"Overwrite them? All existing parts of that name are replaced.";
+    bool pagefileExists = g_collectPagefile &&
+        GetFileAttributesW((base + L"__pagefile.raw").c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool hiberfilExists = g_collectHiberfil &&
+        GetFileAttributesW((base + L"__hiberfil.raw").c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (imageExists || partsExist || pagefileExists || hiberfilExists) {
+        std::wstring q;
+        if (imageExists) { q += L"\""; q += path; q += L"\" already exists."; }
+        else if (partsExist) { q += L"Split parts \""; q += PartPath(base, 1); q += L"\", ... already exist."; }
+        if (pagefileExists) { if (!q.empty()) q += L"\n"; q += L"__pagefile.raw already exists."; }
+        if (hiberfilExists) { if (!q.empty()) q += L"\n"; q += L"__hiberfil.raw already exists."; }
+        q += L"\n\nOverwrite the existing file(s)?";
         if (ShowSubWindow(0, L"Overwrite?", q, L"Overwrite", L"Cancel", L"", 480, 240) != 1)
             return;
     }
 
     // Disk-space sanity check. Splitting needs room for one extra part while it
-    // moves data out of the image (see SplitImage).
+    // moves data out of the image (see SplitImage). sysBytes is the actual size
+    // of any requested pagefile / hibernation file (already measured above).
     UINT64 needed = (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0);
     if (g_selftest) needed = 512u * 1024 * 1024;
     UINT64 splitExtra = (g_splitBytes && g_splitBytes < needed) ? g_splitBytes : 0;
     UINT64 freeB = 0;
     if (GetVolumeFreeBytes(path, freeB) &&
-        freeB < needed + splitExtra + (UINT64)(1024 * 1024 * 1024)) {
+        freeB < needed + splitExtra + sysBytes + (UINT64)(1024 * 1024 * 1024)) {
         std::wstring msg = L"Not enough free disk space.\n\n"
                            L"Estimated image size: " +
                            std::to_wstring((int)(needed / (1024 * 1024 * 1024)) + 1) +
                            L" GB" +
                            (splitExtra ? L" (+ " + FormatGB(splitExtra) + L" working space for splitting)"
                                        : std::wstring()) +
+                           (sysBytes ? L"\n"
+                                      L"Pagefile / hibernation files: " + FormatGB(sysBytes)
+                                     : std::wstring()) +
                            L"\nFree space on target volume: " +
                            std::to_wstring((int)(freeB / (1024 * 1024 * 1024))) + L" GB";
         ShowSubWindow(0, L"Not enough disk space", msg, L"OK", L"", L"", 480, 240);
@@ -2197,6 +2495,31 @@ static void OnCloseWhileCapturing() {
     if (g_capturing) RequestStop();
 }
 
+// One-line-per-file summary of the pagefile / hibernation files collected in
+// this run, for the completion dialog (empty string when none were requested).
+static std::wstring SysFileSummary(const CaptureResult* r) {
+    if (r->sysfiles.empty()) return std::wstring();
+    std::wstring s = L"Also collected:\n";
+    for (const SysFileCapture& f : r->sysfiles) {
+        std::wstring label = (f.kind == L"pagefile") ? L"Pagefile  " : L"Hiberfile ";
+        if (!f.path.empty()) {
+            s += label + L" " + std::to_wstring(f.bytes / (1024 * 1024)) +
+                 L" MB -> " + f.path + L"\n";
+        } else {
+            s += label + L" " + (f.error.empty() ? L"not collected\n" : f.error + L"\n");
+        }
+    }
+    s += L"Each has its own .meta sidecar.\n";
+    return s;
+}
+
+// True when at least one requested system file was actually copied to disk.
+static bool HasCollectedSysFile(const CaptureResult* r) {
+    for (const SysFileCapture& f : r->sysfiles)
+        if (!f.path.empty()) return true;
+    return false;
+}
+
 static void OnCaptureFinished() {
     g_capturing = false;
     SetBusy(false);
@@ -2232,10 +2555,11 @@ static void OnCaptureFinished() {
                L" MB  (" + std::to_wstring(r->pagesWritten) + L" pages)\n";
         msg += L"Time:   " + FormatDuration(r->seconds) + L"\n";
         msg += L"Speed:  " + std::to_wstring((int)mbps) + L" MB/s\n";
-        msg += L"MD5:     " + HashText(r, r->md5) + L"\n";
         msg += L"SHA-256: " + HashText(r, r->sha256) + L"\n";
         if (!r->method.empty())
             msg += L"Method: " + r->method + L"\n";
+        std::wstring sys = SysFileSummary(r);
+        if (!sys.empty()) msg += L"\n" + sys;
         if (!r->metaPath.empty())
             msg += L"\nMetadata sidecar:\n" + r->metaPath + L"\n";
         if (!r->parts.empty())
@@ -2250,6 +2574,19 @@ static void OnCaptureFinished() {
         UpdateStatus(L"Done - " + std::to_wstring(r->bytesWritten / (1024 * 1024)) +
                      L" MB written.", C.ok);
     } else {
+        // The memory image failed, but a requested pagefile / hibernation file
+        // may still have been collected - report that instead of a flat failure.
+        if (HasCollectedSysFile(r)) {
+            UpdateStatus(L"Memory capture failed; system file(s) collected.", C.danger);
+            std::wstring dir = r->path;
+            size_t sl = dir.find_last_of(L"\\/");
+            if (sl != std::wstring::npos) dir = dir.substr(0, sl);
+            ShowSubWindow(1, L"Memory capture failed",
+                          (r->error.empty() ? L"Memory capture failed." : r->error) +
+                          L"\n\n" + SysFileSummary(r),
+                          L"Close", L"Open folder", dir, 560, 380);
+            return;
+        }
         UpdateStatus(L"Capture failed.", C.danger);
         ShowSubWindow(1, L"Capture failed",
                       r->error.empty() ? L"Capture failed." : r->error,
@@ -2331,11 +2668,10 @@ static void OnSplitHelp() {
         L"4. CHECK THE RESULT\n"
         L"\n"
         L"    certutil -hashfile " + raw + L" SHA256\n"
-        L"    certutil -hashfile " + raw + L" MD5\n"
         L"\n"
-        L"The results must match the \"SHA-256:\" and \"MD5:\" lines in " + meta +
-        L". Each part's own hashes are listed there too. (On Linux/macOS: sha256sum "
-        L"and md5sum.)\n"
+        L"The results must match the \"SHA-256:\" line in " + meta +
+        L". Each part's own SHA-256 is listed there too. (On Linux/macOS: "
+        L"sha256sum.)\n"
         L"\n"
         L"Merging needs free space equal to the full image size.";
     ShowSubWindow(0, L"Merging split images", body, L"Close", L"", L"", 620, 500);
@@ -2436,8 +2772,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // driver checkbox in the second column.
         // Item data = part size in MiB (0 = no split). 4095 MiB instead of 4096
         // keeps each part under FAT32's 4 GiB file limit.
-        // "S&plit" label (Alt+P -> drop-down).
-        g_lblSplit = CreateWindowExW(0, L"STATIC", L"S&plit",
+        // "Sp&lit" label (Alt+L -> drop-down).
+        g_lblSplit = CreateWindowExW(0, L"STATIC", L"Sp&lit",
                                      WS_CHILD | WS_VISIBLE | WS_GROUP | SS_LEFT | SS_CENTERIMAGE,
                                      S(kPad), S(164), S(38), S(24),
                                      hwnd, nullptr, hInst, nullptr);
@@ -2493,29 +2829,53 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_chkDriver, BM_SETCHECK,
                      (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        // Progress bar (y 204, 6px), percentage drawn to its right in DrawMain.
+        // Collect row (y 192..216), same columns as the options row: "Also"
+        // label, pagefile checkbox under the drop-down, hibernation checkbox
+        // under the driver checkbox. The checkboxes carry their own access
+        // keys (Alt+P, Alt+H); the label is decorative.
+        g_lblCollect = CreateWindowExW(0, L"STATIC", L"Also",
+                                       WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+                                       S(kPad), S(192), S(38), S(24),
+                                       hwnd, nullptr, hInst, nullptr);
+        SendMessageW(g_lblCollect, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        g_chkPagefile = CreateWindowExW(0, L"BUTTON", L"&Pagefile (pagefile.sys)",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
+                                        S(kPad + 40), S(193), S(kCol2 - 8 - kPad - 40), S(22),
+                                        hwnd, (HMENU)IDC_CHK_PAGEFILE, hInst, nullptr);
+        SendMessageW(g_chkPagefile, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkPagefile, BM_SETCHECK,
+                     (g_cliCollectPagefile && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
+        g_chkHiberfil = CreateWindowExW(0, L"BUTTON", L"&Hibernation file (hiberfil.sys)",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
+                                        S(kCol2), S(193), S(W - kPad - kCol2), S(22),
+                                        hwnd, (HMENU)IDC_CHK_HIBERFIL, hInst, nullptr);
+        SendMessageW(g_chkHiberfil, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkHiberfil, BM_SETCHECK,
+                     (g_cliCollectHiberfil && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // Progress bar (y 232, 6px), percentage drawn to its right in DrawMain.
         g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
                                      WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
-                                     S(kPad), S(204), S(W - 2 * kPad - 52), S(6),
+                                     S(kPad), S(232), S(W - 2 * kPad - 52), S(6),
                                      hwnd, (HMENU)IDC_PROGRESS, hInst, nullptr);
         SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
 
-        // Action row (y 246..278): "Always on top" left, Capture + Close right.
+        // Action row (y 274..306): "Always on top" left, Capture + Close right.
         g_chkTop = CreateWindowExW(0, L"BUTTON", L"&Always on top",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                   S(kPad), S(252), S(130), S(20),
+                                   S(kPad), S(280), S(130), S(20),
                                    hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
         // Capture before Close so Tab goes left to right.
-        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(246), S(104), S(32),
+        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(274), S(104), S(32),
                                   BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
-        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(246), S(84), S(32),
+        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(274), S(84), S(32),
                                 BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
 
-        // Footer links (y 290..318 strip).
+        // Footer links (y 318..346 strip).
         g_btnDisc = MakeButton(hwnd, L"D&isclaimer", S(12), S(kFooterY + 4), S(70), S(20),
                                BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fFoot, dpi);
         g_btnPriv = MakeButton(hwnd, L"Pri&vacy Policy", S(84), S(kFooterY + 4), S(88), S(20),
@@ -2563,12 +2923,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_CTLCOLORSTATIC:
         // Checkboxes and labels sit on the grey body background, not on white boxes.
-        if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver) {
+        if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver ||
+            (HWND)lp == g_chkPagefile || (HWND)lp == g_chkHiberfil) {
             SetBkColor((HDC)wp, C.bg);
             SetTextColor((HDC)wp, C.secText);
             return (LRESULT)g_brBg;
         }
-        if ((HWND)lp == g_lblSave || (HWND)lp == g_lblSplit) {
+        if ((HWND)lp == g_lblSave || (HWND)lp == g_lblSplit || (HWND)lp == g_lblCollect) {
             SetBkColor((HDC)wp, C.bg);
             SetTextColor((HDC)wp, (HWND)lp == g_lblSave ? C.label : C.muted);
             return (LRESULT)g_brBg;
@@ -2679,10 +3040,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_capturing && (!stopping || g_phase == CapturePhase::Splitting) &&
             !(g_closeAfterStop && g_phase == CapturePhase::Splitting)) {
             std::wstring s;
-            if (g_phase == CapturePhase::Splitting)
+            if (g_phase == CapturePhase::Collecting)
+                s = L"Collecting pagefile / hibernation file...";
+            else if (g_phase == CapturePhase::Splitting)
                 s = L"Splitting image into parts...";
             else if (g_phase == CapturePhase::Hashing)
-                s = L"Computing MD5 + SHA-256...";
+                s = L"Computing SHA-256...";
             else if (g_selftest)
                 s = L"Running self-test (synthetic source)...";
             else if (g_driverMode)
@@ -2806,6 +3169,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 }
             } else if (_wcsicmp(t.c_str(), L"--no-driver") == 0) {
                 g_driverDefault = false;                   // start with driverless selected
+            } else if (_wcsicmp(t.c_str(), L"--pagefile") == 0) {
+                g_cliCollectPagefile = true;               // also collect pagefile.sys
+            } else if (_wcsicmp(t.c_str(), L"--hiberfil") == 0) {
+                g_cliCollectHiberfil = true;               // also collect hiberfil.sys
+            } else if (_wcsicmp(t.c_str(), L"--system-files") == 0) {
+                g_cliCollectPagefile = true;
+                g_cliCollectHiberfil = true;               // both
             } else if (_wcsicmp(t.c_str(), L"--split") == 0 && k + 1 < toks.size()) {
                 // --split <MB>: preselect a part size (0 = no split). Invalid
                 // values are ignored and the drop-down keeps its default.
@@ -2941,7 +3311,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         // manager below only moves focus to a checkbox for its access key.)
         if (m.message == WM_SYSCHAR && (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd))) {
             HWND hit = nullptr;
-            for (HWND c : { g_chkTop, g_chkDriver }) {
+            for (HWND c : { g_chkTop, g_chkDriver, g_chkPagefile, g_chkHiberfil }) {
                 wchar_t t[128] = L"";
                 GetWindowTextW(c, t, 128);
                 const wchar_t* amp = wcschr(t, L'&');
