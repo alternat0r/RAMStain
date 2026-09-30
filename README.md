@@ -64,6 +64,14 @@ build.bat Debug      :: Debug  x64  ->  x64\Debug\RAMstain.exe
 
 Or in Visual Studio: open `RAMstain.sln` → select **Release | x64** → Build.
 
+**Versioning.** Every build bumps the minor version (1.1.0 → 1.2.0 → …).
+A pre-build step runs `scripts\bump-version.ps1`, which rewrites
+`src\version.h`. That header feeds the EXE's version resource, the version in
+the app footer and the `Tool:` line in `.meta`. To change the major version or
+reset the minor, edit the numbers in `src\version.h`; the next build continues
+from there. The bump happens before compiling, so a failed build still uses up
+a number.
+
 ## Running
 
 ```
@@ -137,8 +145,11 @@ src/
   md5.h                 small self-contained MD5 (for capture integrity only)
   legal.h               Disclaimer / Privacy Policy / Terms of Use text
   ramstain.rc           resources (icon, version info)
+  version.h             version numbers (rewritten by scripts\bump-version.ps1 each build)
   RAMstain.ico          app icon
   RAMstain.manifest     DPI awareness + Common Controls v6 (UAC requireAdministrator is set in RAMstain.vcxproj)
+scripts/
+  bump-version.ps1      pre-build step: increments the minor version
 .gitignore              excludes build output, captures (*.raw/*.meta), notes
 ```
 

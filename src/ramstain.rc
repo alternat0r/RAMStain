@@ -1,11 +1,12 @@
 #include <windows.h>
 #include "resource.h"
+#include "version.h"
 
 IDI_RAMSTAIN ICON "RAMstain.ico"
 
 1 VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     RAMSTAIN_VER_MAJOR,RAMSTAIN_VER_MINOR,RAMSTAIN_VER_PATCH,0
+PRODUCTVERSION  RAMSTAIN_VER_MAJOR,RAMSTAIN_VER_MINOR,RAMSTAIN_VER_PATCH,0
 FILEOS          0x40004
 FILETYPE        0x1
 BEGIN
@@ -15,12 +16,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "RAMstain"
             VALUE "FileDescription",  "RAMstain - Compact Physical Memory Capture"
-            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "FileVersion",      RAMSTAIN_VER_STR4
             VALUE "InternalName",     "RAMstain"
             VALUE "LegalCopyright",   "RAMstain"
             VALUE "OriginalFilename", "RAMstain.exe"
             VALUE "ProductName",      "RAMstain"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "ProductVersion",   RAMSTAIN_VER_STR4
         END
     END
     BLOCK "VarFileInfo"

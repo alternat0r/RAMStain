@@ -87,6 +87,10 @@
       <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <Culture>0x0409</Culture>
     </ResourceCompile>
+    <PreBuildEvent>
+      <Command>"$(SystemRoot)\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)scripts\bump-version.ps1" -Header "$(ProjectDir)src\version.h"</Command>
+      <Message>Bumping RAMstain minor version (src\version.h)</Message>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -112,10 +116,15 @@
       <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <Culture>0x0409</Culture>
     </ResourceCompile>
+    <PreBuildEvent>
+      <Command>"$(SystemRoot)\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)scripts\bump-version.ps1" -Header "$(ProjectDir)src\version.h"</Command>
+      <Message>Bumping RAMstain minor version (src\version.h)</Message>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="src\resource.h" />
     <ClInclude Include="src\md5.h" />
+    <ClInclude Include="src\version.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\RAMstain.cpp" />

@@ -45,6 +45,7 @@
 #include "md5.h"
 #include "legal.h"
 #include "resource.h"
+#include "version.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -81,7 +82,7 @@ enum class CapturePhase { Capturing = 0, Hashing = 1 };
 
 static const wchar_t* kWindowClass = L"RAMstain.MainWindow";
 static const wchar_t* kSubClass    = L"RAMstain.SubWindow";
-static const wchar_t* kVersionStr  = L"1.0.0";
+static const wchar_t* kVersionStr  = RAMSTAIN_VER_WSTR;   // src/version.h (bumped each build)
 
 // ---------------------------------------------------------------------------
 //  Theme (light, flat, modern)
