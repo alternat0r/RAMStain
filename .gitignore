@@ -9,6 +9,7 @@ notes.txt
 
 # Local helper scripts (user's git push automation - not part of the project)
 push.bat
+release.bat
 
 # --- Visual Studio / MSBuild build output -----------------------------------
 # Compiled binaries and intermediate files (never commit build products)

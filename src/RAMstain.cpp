@@ -124,9 +124,20 @@ struct Theme {
 static Theme C;
 
 static HBRUSH g_brBg = nullptr, g_brHeader = nullptr, g_brWhite = nullptr;
+static HBRUSH g_brLine = nullptr, g_brFooter = nullptr;  // separators, footer strip
 static HPEN   g_penEditBorder = nullptr, g_penNull = nullptr;
 static HFONT  g_fTitle = nullptr, g_fBody = nullptr, g_fLabel = nullptr, g_fSmall = nullptr, g_fEdit = nullptr;
 static HFONT  g_fText = nullptr;  // normal-weight body text for dialog/document windows
+static HFONT  g_fFoot = nullptr;  // header subtitle / footer text
+
+// Main window layout, in 96-dpi pixels (scaled with Sc()). Client area is
+// kDesignW x kDesignH; see DrawMain and WM_CREATE for the rows.
+static const int kDesignW = 520, kDesignH = 318;
+static const int kPad     = 16;   // outer margin
+static const int kHeaderH = 48;   // dark header band
+static const int kCol2    = 268;  // x of the second column (Host/OS, driver checkbox)
+static const int kBrowseW = 80;   // Browse button width
+static const int kFooterY = 290;  // top of the footer strip
 static HICON  g_hIcon = nullptr;
 
 static HWND   g_hwnd = nullptr;
@@ -1230,7 +1241,7 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
     if (st.style == BtnStyle::Link) {
         RECT fr = rc;
         fr.left -= 2; fr.top -= 2; fr.right += 2; fr.bottom += 2;
-        FillRect(hdc, &fr, g_brBg);
+        FillRect(hdc, &fr, g_brFooter);   // links sit in the footer strip
     } else {
         COLORREF fill;
         if (disabled) fill = C.disabledFill;
@@ -1395,24 +1406,33 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     hwnd, (HMENU)IDC_SUB_TEXT, GetModuleHandleW(nullptr), nullptr);
         // Normal weight: g_fBody is semibold, which made whole documents bold.
         SendMessageW(edit, WM_SETFONT, (WPARAM)g_fText, TRUE);
+        {
+            // Inner padding so text does not touch the border.
+            RECT tr;
+            GetClientRect(edit, &tr);
+            tr.left += Sc(10, dpi); tr.top += Sc(8, dpi); tr.right -= Sc(6, dpi); tr.bottom -= Sc(6, dpi);
+            SendMessageW(edit, EM_SETRECT, 0, (LPARAM)&tr);
+        }
 
-        int by = H - Sc(56, dpi);
-        int bh = Sc(34, dpi);
+        // Buttons match the main window: 32px tall, primary right-most.
+        int by = H - Sc(52, dpi);
+        int bh = Sc(32, dpi);
+        int pw = Sc(150, dpi), sw = Sc(120, dpi);
         HWND b1 = MakeButton(hwnd, g_subSpec.primaryBtn.c_str(),
-                             W - Sc(16, dpi) - Sc(110, dpi), by, Sc(110, dpi), bh,
-                             BtnStyle::Primary, (HMENU)IDC_SUB_PRIMARY, g_fSmall, dpi);
+                             W - Sc(16, dpi) - pw, by, pw, bh,
+                             BtnStyle::Primary, (HMENU)IDC_SUB_PRIMARY, g_fBody, dpi);
         if (!g_subSpec.secondBtn.empty()) {
             MakeButton(hwnd, g_subSpec.secondBtn.c_str(),
-                       W - Sc(16, dpi) - Sc(110, dpi) - Sc(10, dpi) - Sc(130, dpi), by,
-                       Sc(130, dpi), bh, BtnStyle::Secondary, (HMENU)IDC_SUB_SECOND, g_fSmall, dpi);
+                       W - Sc(16, dpi) - pw - Sc(8, dpi) - sw, by,
+                       sw, bh, BtnStyle::Secondary, (HMENU)IDC_SUB_SECOND, g_fSmall, dpi);
         }
         (void)b1;
         return 0;
     }
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
-        SetTextColor((HDC)lp, C.text);
-        SetBkColor((HDC)lp, C.white);
+        SetTextColor((HDC)wp, C.text);
+        SetBkColor((HDC)wp, C.white);
         return (LRESULT)g_brWhite;
     case WM_ERASEBKGND:
         return 1;
@@ -1557,115 +1577,83 @@ static void DrawMain(HDC dc, HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     int dpi = GetDpiForWindow(hwnd);
-    int W = rc.right, H = rc.bottom;
+    int W = rc.right;
+    auto S = [dpi](int v) { return Sc(v, dpi); };
 
-    // Background
     FillRect(dc, &rc, g_brBg);
-
-    // Header band
-    RECT hr = { 0, 0, W, Sc(64, dpi) };
-    FillRect(dc, &hr, g_brHeader);
-
-    if (g_hIcon)
-        DrawIconEx(dc, Sc(16, dpi), Sc(14, dpi), g_hIcon, Sc(36, dpi), Sc(36, dpi), 0, nullptr, DI_NORMAL);
     SetBkMode(dc, TRANSPARENT);
-    HFONT old = (HFONT)SelectObject(dc, g_fTitle);
-    SetTextColor(dc, C.white);
-    RECT tr = { Sc(64, dpi), Sc(6, dpi), W, Sc(42, dpi) };
-    DrawTextW(dc, L"RAMstain", -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    old = (HFONT)SelectObject(dc, g_fSmall);
-    SetTextColor(dc, C.headerSub);
-    RECT sr = { Sc(64, dpi), Sc(38, dpi), W, Sc(62, dpi) };
-    std::wstring sub = g_selftest ? L"Physical Memory Capture  -  SELF-TEST"
-                                  : L"Physical Memory Capture";
-    DrawTextW(dc, sub.c_str(), -1, &sr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(dc, g_fBody);
 
-    auto label = [&](int x, int y, const wchar_t* s) {
-        HFONT of = (HFONT)SelectObject(dc, g_fLabel);
-        SetTextColor(dc, C.label);
-        RECT r = { x, y, x + Sc(300, dpi), y + Sc(16, dpi) };
-        DrawTextW(dc, s, -1, &r, DT_LEFT | DT_TOP | DT_SINGLELINE);
-        SelectObject(dc, of);
-    };
-    auto value = [&](int x, int y, const std::wstring& s, HFONT f = nullptr, COLORREF col = C.text) {
-        HFONT of = (HFONT)SelectObject(dc, f ? f : g_fBody);
+    auto text = [&](const std::wstring& s, RECT r, HFONT f, COLORREF col, UINT fmt) {
+        HFONT of = (HFONT)SelectObject(dc, f);
         SetTextColor(dc, col);
-        RECT r = { x, y, x + Sc(280, dpi), y + Sc(22, dpi) };
-        DrawTextW(dc, s.c_str(), -1, &r, DT_LEFT | DT_TOP | DT_SINGLELINE);
+        DrawTextW(dc, s.c_str(), -1, &r, fmt | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, of);
     };
+    auto hline = [&](int y) {
+        RECT r = { S(kPad), y, W - S(kPad), y + 1 };
+        FillRect(dc, &r, g_brLine);
+    };
 
-    // Save location
-    label(Sc(32, dpi), Sc(96, dpi), L"SAVE LOCATION");
-    RECT er = { Sc(32, dpi), Sc(116, dpi), Sc(484, dpi), Sc(148, dpi) };
-    // Flat (square-cornered) field outline - no rounded "card" look.
+    // Header band: icon, name + subtitle, version on the right.
+    RECT hr = { 0, 0, W, S(kHeaderH) };
+    FillRect(dc, &hr, g_brHeader);
+    if (g_hIcon)
+        DrawIconEx(dc, S(kPad), S(12), g_hIcon, S(24), S(24), 0, nullptr, DI_NORMAL);
+    text(L"RAMstain", { S(50), S(7), W, S(27) }, g_fTitle, C.white, DT_LEFT | DT_VCENTER);
+    text(g_selftest ? L"Physical Memory Capture  ·  SELF-TEST" : L"Physical Memory Capture",
+         { S(50), S(26), W, S(42) }, g_fFoot, C.headerSub, DT_LEFT | DT_VCENTER);
+    text(std::wstring(L"v") + kVersionStr, { W - S(140), 0, W - S(kPad), S(kHeaderH) },
+         g_fFoot, C.headerSub, DT_RIGHT | DT_VCENTER);
+
+    // Save location: small caps label, white field with a 1px border.
+    text(L"SAVE TO", { S(kPad), S(58), W, S(72) }, g_fLabel, C.label, DT_LEFT | DT_VCENTER);
+    RECT er = { S(kPad), S(74), W - S(kPad) - S(kBrowseW) - S(8), S(100) };
     {
         HPEN op = (HPEN)SelectObject(dc, g_penEditBorder);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, (HBRUSH)GetStockObject(NULL_BRUSH));
+        HBRUSH ob = (HBRUSH)SelectObject(dc, g_brWhite);
         Rectangle(dc, er.left, er.top, er.right, er.bottom);
         SelectObject(dc, ob);
         SelectObject(dc, op);
     }
 
-    // System info grid
+    // System info: two compact "label  value" lines in two columns.
     double gb = GetTotalRamGB();
     std::wstring est = g_selftest ? L"512 MB (synthetic)"
-                                  : (std::to_wstring((int)gb) + L" GB  -  4 KiB pages");
-    int x1 = Sc(32, dpi), x2 = Sc(330, dpi);
-    label(x1, Sc(168, dpi), L"PHYSICAL MEMORY");
-    value(x1, Sc(184, dpi), std::to_wstring((int)gb) + L" GB");
-    label(x1, Sc(212, dpi), L"ESTIMATED IMAGE");
-    value(x1, Sc(228, dpi), est);
-    label(x2, Sc(168, dpi), L"HOST");
-    value(x2, Sc(184, dpi), GetComputerName());
-    label(x2, Sc(212, dpi), L"OS");
-    value(x2, Sc(228, dpi), GetOsVersionString());
+                                  : (L"~" + std::to_wstring((int)gb) + L" GB  ·  4 KiB pages");
+    int x1 = S(kPad), x2 = S(kCol2), lw = S(56);
+    auto kv = [&](int x, int y, const wchar_t* k, const std::wstring& v) {
+        text(k, { x, y, x + lw, y + S(18) }, g_fSmall, C.muted, DT_LEFT | DT_VCENTER);
+        text(v, { x + lw, y, (x == x1 ? x2 - S(8) : W - S(kPad)), y + S(18) },
+             g_fBody, C.text, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    };
+    kv(x1, S(108), L"Memory", std::to_wstring((int)gb) + L" GB");
+    kv(x2, S(108), L"Host", GetComputerName());
+    kv(x1, S(128), L"Image", est);
+    kv(x2, S(128), L"OS", GetOsVersionString());
 
-    // Progress
-    // Split option (combo box g_cmbSplit sits under this label).
-    label(x1, Sc(262, dpi), L"SPLIT IMAGE");
-    {
-        HFONT ofh = (HFONT)SelectObject(dc, g_fSmall);
-        SetTextColor(dc, C.muted);
-        RECT hr2 = { Sc(284, dpi), Sc(278, dpi), W - Sc(32, dpi), Sc(306, dpi) };
-        DrawTextW(dc, L"Parts are named <name>.001, <name>.002, ...", -1, &hr2,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        SelectObject(dc, ofh);
-    }
+    hline(S(154));
 
-    label(Sc(32, dpi), Sc(314, dpi), L"PROGRESS");
-    int pr = 0;
-    if (g_progress) {
-        int val = (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0);
-        pr = val;
-    }
-    std::wstring pct = std::to_wstring(pr) + L"%";
-    SetBkMode(dc, TRANSPARENT);
-    HFONT of = (HFONT)SelectObject(dc, g_fBody);
-    SetTextColor(dc, C.text);
-    RECT prr = { W - Sc(80, dpi), Sc(324, dpi), W - Sc(32, dpi), Sc(344, dpi) };
-    DrawTextW(dc, pct.c_str(), -1, &prr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(dc, of);
+    // Options row: "Split" label in front of the combo (the combo and the
+    // driver checkbox are child controls).
+    text(L"Split", { S(kPad), S(164), S(kPad) + S(40), S(188) }, g_fSmall, C.muted,
+         DT_LEFT | DT_VCENTER);
 
-    // Status
-    if (!g_status.empty()) {
-        HFONT of2 = (HFONT)SelectObject(dc, g_fSmall);
-        SetTextColor(dc, g_statusColor);
-        RECT sr2 = { Sc(32, dpi), Sc(348, dpi), W - Sc(32, dpi), Sc(368, dpi) };
-        DrawTextW(dc, g_status.c_str(), -1, &sr2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(dc, of2);
-    }
+    // Progress percentage (the bar itself is a child control) and status line.
+    int pr = g_progress ? (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0) : 0;
+    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(198), W - S(kPad), S(216) },
+         g_fBody, C.text, DT_RIGHT | DT_VCENTER);
+    if (!g_status.empty())
+        text(g_status, { S(kPad), S(218), W - S(kPad), S(236) }, g_fSmall, g_statusColor,
+             DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
-    // Footer
-    {
-        HFONT of3 = (HFONT)SelectObject(dc, g_fSmall);
-        SetTextColor(dc, C.muted);
-        RECT vr = { Sc(16, dpi), Sc(454, dpi), Sc(150, dpi), Sc(476, dpi) };
-        DrawTextW(dc, (std::wstring(L"v") + kVersionStr).c_str(),
-                  -1, &vr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(dc, of3);
-    }
+    // Footer strip: slightly darker band with a top border; links are child
+    // controls on the left, the offline note is drawn on the right.
+    RECT fr = { 0, S(kFooterY), W, S(kDesignH) };
+    FillRect(dc, &fr, g_brFooter);
+    RECT fl = { 0, S(kFooterY), W, S(kFooterY) + 1 };
+    FillRect(dc, &fl, g_brLine);
+    text(L"Offline · no data leaves this PC", { W - S(220), S(kFooterY), W - S(kPad), S(kDesignH) },
+         g_fFoot, C.muted, DT_RIGHT | DT_VCENTER);
 }
 
 // ---------------------------------------------------------------------------
@@ -2025,6 +2013,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         int dpi = GetDpiForWindow(hwnd);
+        auto S = [dpi](int v) { return Sc(v, dpi); };
         auto f = [&](int px, LONG weight) {
             LOGFONTW lf;
             ZeroMemory(&lf, sizeof(lf));
@@ -2035,83 +2024,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             lstrcpyW(lf.lfFaceName, L"Segoe UI");
             return CreateFontIndirectW(&lf);
         };
-        g_fTitle = f(Sc(19, dpi), FW_SEMIBOLD);
-        g_fBody  = f(Sc(14, dpi), FW_SEMIBOLD);
-        g_fLabel = f(Sc(10, dpi), FW_SEMIBOLD);
-        g_fSmall = f(Sc(12, dpi), FW_NORMAL);
-        g_fEdit  = f(Sc(13, dpi), FW_NORMAL);
-        g_fText  = f(Sc(14, dpi), FW_NORMAL);
+        g_fTitle = f(S(16), FW_SEMIBOLD);   // header name
+        g_fBody  = f(S(12), FW_SEMIBOLD);   // info values, percentage, Capture button
+        g_fLabel = f(S(10), FW_SEMIBOLD);   // small-caps section label
+        g_fSmall = f(S(12), FW_NORMAL);     // controls, info labels, status
+        g_fEdit  = f(S(12), FW_NORMAL);     // save-path field
+        g_fText  = f(S(13), FW_NORMAL);     // dialog / document body text
+        g_fFoot  = f(S(11), FW_NORMAL);     // header subtitle, footer
         HINSTANCE hInst = ((LPCREATESTRUCT)lp)->hInstance;
+        const int W = kDesignW;
 
-        // Save path edit (custom border drawn in WM_PAINT)
+        // Save path: borderless edit inside the white field drawn in DrawMain
+        // (x 16..416, y 74..100), vertically centred.
         g_editPath = CreateWindowExW(0, L"EDIT", L"",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                      Sc(33, dpi), Sc(117, dpi), Sc(450, dpi), Sc(30, dpi),
+                                      S(kPad + 5), S(79), S(W - 2 * kPad - kBrowseW - 8 - 10), S(17),
                                       hwnd, (HMENU)IDC_EDIT_PATH, hInst, nullptr);
         SendMessageW(g_editPath, WM_SETFONT, (WPARAM)g_fEdit, TRUE);
         SetTextW(g_editPath, g_cliPath.empty() ? DefaultDumpPath() : g_cliPath);
-
-        // Buttons
-        g_btnBrowse = MakeButton(hwnd, L"Browse...", Sc(492, dpi), Sc(116, dpi), Sc(96, dpi), Sc(32, dpi),
+        g_btnBrowse = MakeButton(hwnd, L"Browse...", S(W - kPad - kBrowseW), S(74), S(kBrowseW), S(26),
                                  BtnStyle::Secondary, (HMENU)IDC_BTN_BROWSE, g_fSmall, dpi);
-        g_btnCapture = MakeButton(hwnd, L"Capture", Sc(32, dpi), Sc(404, dpi), Sc(150, dpi), Sc(38, dpi),
-                                  BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
-        g_btnClose = MakeButton(hwnd, L"Close", Sc(194, dpi), Sc(404, dpi), Sc(120, dpi), Sc(38, dpi),
-                                BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
 
-        // Progress bar
-        g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
-                                     WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
-                                     Sc(32, dpi), Sc(330, dpi), Sc(508, dpi), Sc(12, dpi),
-                                     hwnd, (HMENU)IDC_PROGRESS, hInst, nullptr);
-        SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-        SendMessageW(g_progress, PBM_SETPOS, 0, 0);
-        SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
-
-        // Footer links
-        g_btnDisc = MakeButton(hwnd, L"Disclaimer", Sc(300, dpi), Sc(454, dpi), Sc(88, dpi), Sc(24, dpi),
-                               BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fSmall, dpi);
-        g_btnPriv = MakeButton(hwnd, L"Privacy Policy", Sc(394, dpi), Sc(454, dpi), Sc(106, dpi), Sc(24, dpi),
-                               BtnStyle::Link, (HMENU)IDC_BTN_PRIV, g_fSmall, dpi);
-        g_btnTerms = MakeButton(hwnd, L"Terms of Use", Sc(506, dpi), Sc(454, dpi), Sc(92, dpi), Sc(24, dpi),
-                                BtnStyle::Link, (HMENU)IDC_BTN_TERMS, g_fSmall, dpi);
-
-        g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, Sc(36, dpi), Sc(36, dpi), 0);
-
-        // "Always on top" checkbox (footer, default off).
-        g_chkTop = CreateWindowExW(0, L"BUTTON", L"Always on top",
-                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                   Sc(156, dpi), Sc(453, dpi), Sc(124, dpi), Sc(24, dpi),
-                                   hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
-        SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
-
-        // "Use WinPmem driver" checkbox - in the button row, to the right of
-        // the Close/Stop button (which ends at x=314), so it never overlaps.
-        // Vertically centered on the 38px-tall buttons (y=404..442).
-        // Default on (the driver is the primary method); --no-driver clears it.
-        g_chkDriver = CreateWindowExW(0, L"BUTTON",
-                                      L"Use WinPmem driver (recommended)",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                      Sc(320, dpi), Sc(411, dpi), Sc(268, dpi), Sc(24, dpi),
-                                      hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
-        SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
-        SendMessageW(g_chkDriver, BM_SETCHECK,
-                     (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
-
-        // "SPLIT IMAGE" drop-down. Item data = part size in MiB (0 = no split).
-        // 4095 MiB instead of 4096 keeps each part under FAT32's 4 GiB file limit.
+        // Options row (y 164..188): split drop-down after the "Split" label,
+        // driver checkbox in the second column.
+        // Item data = part size in MiB (0 = no split). 4095 MiB instead of 4096
+        // keeps each part under FAT32's 4 GiB file limit.
         g_cmbSplit = CreateWindowExW(0, WC_COMBOBOXW, L"",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
-                                     Sc(32, dpi), Sc(278, dpi), Sc(240, dpi), Sc(220, dpi),
+                                     S(kPad + 40), S(164), S(180), S(220),
                                      hwnd, (HMENU)IDC_CMB_SPLIT, hInst, nullptr);
         SendMessageW(g_cmbSplit, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         {
             struct { UINT mb; const wchar_t* text; } kSplit[] = {
-                { 0,     L"Do not split (one file)" },
+                { 0,     L"No split (one file)" },
                 { 1024,  L"1 GB parts" },
                 { 2048,  L"2 GB parts" },
-                { 4095,  L"4 GB parts (FAT32-safe, 4095 MB)" },
+                { 4095,  L"4 GB parts (FAT32-safe)" },
                 { 8192,  L"8 GB parts" },
                 { 16384, L"16 GB parts" },
             };
@@ -2122,20 +2070,67 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_cliSplitMB && s.mb == g_cliSplitMB) sel = i;
             }
             if (g_cliSplitMB && sel == 0) {      // --split <MB> with a non-preset size
-                std::wstring t = std::to_wstring(g_cliSplitMB) + L" MB parts (command line)";
+                std::wstring t = std::to_wstring(g_cliSplitMB) + L" MB parts";
                 sel = (int)SendMessageW(g_cmbSplit, CB_ADDSTRING, 0, (LPARAM)t.c_str());
                 SendMessageW(g_cmbSplit, CB_SETITEMDATA, sel, (LPARAM)g_cliSplitMB);
             }
             SendMessageW(g_cmbSplit, CB_SETCURSEL, sel, 0);
         }
 
+        // Default on (the driver is the primary method); --no-driver clears it.
+        g_chkDriver = CreateWindowExW(0, L"BUTTON", L"Use WinPmem driver (recommended)",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                      S(kCol2), S(165), S(W - kPad - kCol2), S(22),
+                                      hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
+        SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkDriver, BM_SETCHECK,
+                     (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // Progress bar (y 204, 6px), percentage drawn to its right in DrawMain.
+        g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+                                     WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+                                     S(kPad), S(204), S(W - 2 * kPad - 52), S(6),
+                                     hwnd, (HMENU)IDC_PROGRESS, hInst, nullptr);
+        SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+        SendMessageW(g_progress, PBM_SETPOS, 0, 0);
+        SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
+
+        // Action row (y 246..278): "Always on top" left, Capture + Close right.
+        g_chkTop = CreateWindowExW(0, L"BUTTON", L"Always on top",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                   S(kPad), S(252), S(130), S(20),
+                                   hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
+        SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
+        SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
+        g_btnClose = MakeButton(hwnd, L"Close", S(W - kPad - 84), S(246), S(84), S(32),
+                                BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
+        g_btnCapture = MakeButton(hwnd, L"Capture", S(W - kPad - 84 - 8 - 104), S(246), S(104), S(32),
+                                  BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
+
+        // Footer links (y 290..318 strip).
+        g_btnDisc = MakeButton(hwnd, L"Disclaimer", S(12), S(kFooterY + 4), S(70), S(20),
+                               BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fFoot, dpi);
+        g_btnPriv = MakeButton(hwnd, L"Privacy Policy", S(84), S(kFooterY + 4), S(88), S(20),
+                               BtnStyle::Link, (HMENU)IDC_BTN_PRIV, g_fFoot, dpi);
+        g_btnTerms = MakeButton(hwnd, L"Terms of Use", S(174), S(kFooterY + 4), S(84), S(20),
+                                BtnStyle::Link, (HMENU)IDC_BTN_TERMS, g_fFoot, dpi);
+
+        g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_RAMSTAIN), IMAGE_ICON, S(24), S(24), 0);
+
         g_status = L"Ready.";
         g_statusColor = C.muted;
         return 0;
     }
     case WM_CTLCOLORSTATIC:
+        // Checkboxes sit on the grey body background, not on white boxes.
+        if ((HWND)lp == g_chkTop || (HWND)lp == g_chkDriver) {
+            SetBkColor((HDC)wp, C.bg);
+            SetTextColor((HDC)wp, C.secText);
+            return (LRESULT)g_brBg;
+        }
+        [[fallthrough]];
     case WM_CTLCOLOREDIT:
-        SetBkColor((HDC)lp, C.white);
+        SetBkColor((HDC)wp, C.white);
         return (LRESULT)g_brWhite;
     case WM_ERASEBKGND:
         return 1;
@@ -2266,8 +2261,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // the real window must be a little larger than the client to absorb the
         // DWM frame, and an over-tight max would clamp the post-creation
         // client-size correction in wWinMain.
-        mmi->ptMinTrackSize.x = Sc(620, dpi);
-        mmi->ptMinTrackSize.y = Sc(484, dpi);
+        mmi->ptMinTrackSize.x = Sc(kDesignW, dpi);
+        mmi->ptMinTrackSize.y = Sc(kDesignH, dpi);
         mmi->ptMaxTrackSize.x = 4000;
         mmi->ptMaxTrackSize.y = 4000;
         return 0;
@@ -2298,6 +2293,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static void CreateThemeGfx() {
     g_brBg = CreateSolidBrush(C.bg);
     g_brHeader = CreateSolidBrush(C.header);
+    g_brLine = CreateSolidBrush(RGB(226, 232, 240));
+    g_brFooter = CreateSolidBrush(RGB(241, 245, 249));
     g_brWhite = CreateSolidBrush(C.white);
     g_penEditBorder = CreatePen(PS_SOLID, 1, RGB(203, 213, 225));
     g_penNull = (HPEN)GetStockObject(NULL_PEN);
@@ -2306,9 +2303,11 @@ static void CreateThemeGfx() {
 static void DestroyThemeGfx() {
     if (g_brBg) DeleteObject(g_brBg);
     if (g_brHeader) DeleteObject(g_brHeader);
+    if (g_brLine) DeleteObject(g_brLine);
+    if (g_brFooter) DeleteObject(g_brFooter);
     if (g_brWhite) DeleteObject(g_brWhite);
     if (g_penEditBorder) DeleteObject(g_penEditBorder);
-    for (HFONT f : { g_fTitle, g_fBody, g_fLabel, g_fSmall, g_fEdit, g_fText })
+    for (HFONT f : { g_fTitle, g_fBody, g_fLabel, g_fSmall, g_fEdit, g_fText, g_fFoot })
         if (f) DeleteObject(f);
     if (g_hIcon) DestroyIcon(g_hIcon);
 }
@@ -2400,13 +2399,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     ws.lpszClassName = kSubClass;
     if (!RegisterClassExW(&ws)) return 1;
 
-    // Fixed-size main window (620x484 CLIENT @ 96dpi).
+    // Fixed-size main window (kDesignW x kDesignH CLIENT @ 96dpi).
     // AdjustWindowRect under-counts the DWM invisible border on Win10/11, so
     // after creating we measure the real client size and nudge the window by
     // the delta to force the exact client size our layout is designed for.
     int dpi = GetDpiForSystem();
-    const int kClientW = Sc(620, dpi);
-    const int kClientH = Sc(484, dpi);
+    const int kClientW = Sc(kDesignW, dpi);
+    const int kClientH = Sc(kDesignH, dpi);
     RECT rc = { 0, 0, kClientW, kClientH };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX, FALSE);
     int w = rc.right - rc.left;

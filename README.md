@@ -128,7 +128,7 @@ memory. The `.meta` sidecar is clearly marked `SELF-TEST synthetic source`.
 
 ## Splitting large images
 
-Choose a part size under **Split image** (or pass `--split <MB>`) to get the
+Choose a part size in the **Split** drop-down (or pass `--split <MB>`) to get the
 image as `<name>.001`, `<name>.002`, … instead of one large `.raw`. This is
 the split-raw convention that FTK Imager, X-Ways and Autopsy open directly.
 Pick **4 GB parts (FAT32-safe)** when the target is a FAT32 USB stick, which
