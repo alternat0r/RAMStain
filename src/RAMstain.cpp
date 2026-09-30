@@ -92,6 +92,7 @@ static const wchar_t* kVersionStr  = RAMSTAIN_VER_WSTR;   // src/version.h (bump
 struct Theme {
     COLORREF bg, header, headerSub, text, muted, label;
     COLORREF accent, accentHover, accentDown, secBorder, secText, secFill;
+    COLORREF secHoverFill, secDownFill;
     COLORREF danger, dangerHover, dangerDown, ok, white, disabledFill, disabledText;
     Theme() {
         bg           = RGB(248, 250, 252);
@@ -101,14 +102,18 @@ struct Theme {
         muted        = RGB(100, 116, 139);
         label        = RGB(100, 116, 139);
         accent       = RGB(37, 99, 235);
-        accentHover  = RGB(29, 78, 216);
-        accentDown   = RGB(23, 64, 142);
+        // Hover colors are deliberately distinct from the resting color so the
+        // Capture / Stop / Close buttons visibly react to the pointer.
+        accentHover  = RGB(30, 64, 175);    // Capture: blue -> deep blue
+        accentDown   = RGB(23, 37, 84);
         secBorder    = RGB(203, 213, 225);
         secText      = RGB(30, 41, 59);
         secFill      = RGB(255, 255, 255);
+        secHoverFill = RGB(219, 234, 254);  // Close: white -> light blue, blue border + text
+        secDownFill  = RGB(191, 219, 254);
         danger       = RGB(220, 38, 38);
-        dangerHover  = RGB(190, 18, 18);
-        dangerDown   = RGB(153, 27, 27);
+        dangerHover  = RGB(153, 27, 27);    // Stop: red -> dark red
+        dangerDown   = RGB(127, 29, 29);
         ok           = RGB(5, 150, 105);
         white        = RGB(255, 255, 255);
         disabledFill = RGB(241, 245, 249);
@@ -120,6 +125,7 @@ static Theme C;
 static HBRUSH g_brBg = nullptr, g_brHeader = nullptr, g_brWhite = nullptr;
 static HPEN   g_penEditBorder = nullptr, g_penNull = nullptr;
 static HFONT  g_fTitle = nullptr, g_fBody = nullptr, g_fLabel = nullptr, g_fSmall = nullptr, g_fEdit = nullptr;
+static HFONT  g_fText = nullptr;  // normal-weight body text for dialog/document windows
 static HICON  g_hIcon = nullptr;
 
 static HWND   g_hwnd = nullptr;
@@ -127,6 +133,8 @@ static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
               g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver;
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
+static bool   g_finishPending = false; // capture finished while a dialog was open
+static bool   g_closeAfterStop = false;// user chose "Stop and close": exit when the capture ends
 static bool   g_selftest  = false;
 static bool   g_topmost   = false;   // "Always on top" (default off)
 static bool   g_driverMode = false;  // resolved per capture from the "Use WinPmem driver" checkbox
@@ -1036,7 +1044,7 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
         else if (st.style == BtnStyle::Danger)
             fill = pressed ? C.dangerDown : (st.hover ? C.dangerHover : C.danger);
         else
-            fill = pressed ? RGB(241, 245, 249) : C.secFill;
+            fill = pressed ? C.secDownFill : (st.hover ? C.secHoverFill : C.secFill);
         HBRUSH brFill = CreateSolidBrush(fill);
         DrawRoundRect(hdc, rc, r, brFill, g_penNull);
         DeleteObject(brFill);
@@ -1052,7 +1060,7 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
     if (disabled) tcol = C.disabledText;
     else if (st.style == BtnStyle::Link) tcol = st.hover ? C.accentHover : C.accent;
     else if (st.style == BtnStyle::Primary || st.style == BtnStyle::Danger) tcol = C.white;
-    else tcol = C.secText;
+    else tcol = st.hover ? C.accentHover : C.secText;
     SetTextColor(hdc, tcol);
 
     if (st.style == BtnStyle::Link) {
@@ -1073,6 +1081,47 @@ static void PaintOwnerButton(LPDRAWITEMSTRUCT di) {
     SelectObject(hdc, old);
 }
 
+// Hover tracking for owner-drawn buttons. While the pointer is over a button,
+// Windows sends WM_MOUSEMOVE to the button itself, not to the parent, so the
+// button must track hover on its own: WM_MOUSEMOVE turns hover on and asks for
+// a WM_MOUSELEAVE, which turns it off again.
+static LRESULT CALLBACK OwnerButtonProc(HWND b, UINT msg, WPARAM wp, LPARAM lp,
+                                        UINT_PTR, DWORD_PTR) {
+    switch (msg) {
+    case WM_MOUSEMOVE: {
+        auto it = g_btns.find(b);
+        if (it != g_btns.end() && !it->second.hover) {
+            it->second.hover = true;
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, b, 0 };
+            TrackMouseEvent(&tme);
+            InvalidateRect(b, nullptr, FALSE);
+        }
+        break;
+    }
+    case WM_MOUSELEAVE: {
+        auto it = g_btns.find(b);
+        if (it != g_btns.end() && it->second.hover) {
+            it->second.hover = false;
+            InvalidateRect(b, nullptr, FALSE);
+        }
+        break;
+    }
+    case WM_SETCURSOR: {
+        auto it = g_btns.find(b);
+        if (it != g_btns.end() && it->second.style == BtnStyle::Link && IsWindowEnabled(b)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_NCDESTROY:
+        g_btns.erase(b);   // sub-window buttons are recreated per dialog
+        RemoveWindowSubclass(b, OwnerButtonProc, 0);
+        break;
+    }
+    return DefSubclassProc(b, msg, wp, lp);
+}
+
 static HWND MakeButton(HWND parent, const wchar_t* text, int x, int y, int w, int h,
                        BtnStyle style, HMENU id, HFONT f, int dpi) {
     HWND b = CreateWindowExW(0, L"BUTTON", text,
@@ -1081,30 +1130,9 @@ static HWND MakeButton(HWND parent, const wchar_t* text, int x, int y, int w, in
                              GetModuleHandleW(nullptr), nullptr);
     if (f) SendMessageW(b, WM_SETFONT, (WPARAM)f, TRUE);
     g_btns[b] = BtnState{style, false};
+    SetWindowSubclass(b, OwnerButtonProc, 0, 0);
     (void)dpi;
     return b;
-}
-
-static void TrackHover(HWND hwnd, int x, int y) {
-    POINT pt{ x, y };
-    bool onLink = false;
-    for (auto& kv : g_btns) {
-        HWND b = kv.first;
-        if (!IsWindow(b) || (GetParent(b) != hwnd)) continue;
-        RECT r;
-        GetWindowRect(b, &r);
-        POINT p1{ r.left, r.top }, p2{ r.right, r.bottom };
-        ScreenToClient(hwnd, &p1);
-        ScreenToClient(hwnd, &p2);
-        r.left = p1.x; r.top = p1.y; r.right = p2.x; r.bottom = p2.y;
-        bool hov = PtInRect(&r, pt) != 0;
-        if (hov != kv.second.hover) {
-            kv.second.hover = hov;
-            InvalidateRect(hwnd, &r, FALSE);
-        }
-        if (hov && kv.second.style == BtnStyle::Link) onLink = true;
-    }
-    SetCursor(onLink ? LoadCursorW(nullptr, IDC_HAND) : LoadCursorW(nullptr, IDC_ARROW));
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,7 +1198,8 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     Sc(16, dpi), Sc(16, dpi), W - Sc(32, dpi),
                                     H - Sc(16, dpi) - Sc(72, dpi),
                                     hwnd, (HMENU)IDC_SUB_TEXT, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(edit, WM_SETFONT, (WPARAM)g_fBody, TRUE);
+        // Normal weight: g_fBody is semibold, which made whole documents bold.
+        SendMessageW(edit, WM_SETFONT, (WPARAM)g_fText, TRUE);
 
         int by = H - Sc(56, dpi);
         int bh = Sc(34, dpi);
@@ -1240,9 +1269,6 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    case WM_MOUSEMOVE:
-        TrackHover(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         mmi->ptMinTrackSize.x = g_subSpec.w;
@@ -1252,6 +1278,7 @@ static LRESULT CALLBACK SubWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CLOSE:
+        g_subResult = 0;   // closed with X: neither button, callers treat it as cancel
         CloseSubWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -1319,6 +1346,12 @@ static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bod
     }
     if (g_hwnd && IsWindow(g_hwnd)) EnableWindow(g_hwnd, TRUE); // safety net
     g_subHwnd = nullptr;
+    // A capture that finished while this dialog was open: handle it now, so its
+    // result dialog does not open nested inside this one.
+    if (g_finishPending) {
+        g_finishPending = false;
+        PostMessageW(g_hwnd, WM_APP_FINISHED, 0, 0);
+    }
     return g_subResult;
 }
 
@@ -1445,13 +1478,15 @@ static void SetBusy(bool busy) {
     // Stop/Close is always clickable when entering either state; OnCloseButton
     // disables it only while a stop is in progress.
     EnableWindow(g_btnClose, TRUE);
+    // Change only the style; keep the hover flag, which OwnerButtonProc tracks.
     if (busy) {
-        g_btns[g_btnClose] = BtnState{BtnStyle::Danger, false};
+        g_btns[g_btnClose].style = BtnStyle::Danger;
         SetWindowTextW(g_btnClose, L"Stop");
     } else {
-        g_btns[g_btnClose] = BtnState{BtnStyle::Secondary, false};
+        g_btns[g_btnClose].style = BtnStyle::Secondary;
         SetWindowTextW(g_btnClose, L"Close");
     }
+    InvalidateRect(g_btnClose, nullptr, FALSE);
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -1586,14 +1621,38 @@ static void OnCapture() {
     CloseHandle(th);
 }
 
+static bool StopRequested() {
+    return g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0;
+}
+
+static void RequestStop() {
+    if (g_stopEvent) SetEvent(g_stopEvent);
+    UpdateStatus(L"Stopping capture...", C.muted);
+    EnableWindow(g_btnClose, FALSE);
+}
+
+// Close/Stop button: stops a running capture (the button reads "Stop" then),
+// otherwise closes RAMstain.
 static void OnCloseButton() {
-    if (g_capturing) {
-        if (g_stopEvent) SetEvent(g_stopEvent);
-        UpdateStatus(L"Stopping capture...", C.muted);
-        EnableWindow(g_btnClose, FALSE);
-    } else {
-        DestroyWindow(g_hwnd);
+    if (g_capturing) RequestStop();
+    else DestroyWindow(g_hwnd);
+}
+
+// X / Alt+F4 / Esc while a capture is running: ask before stopping it.
+static void OnCloseWhileCapturing() {
+    if (StopRequested()) {           // already stopping: just close when done
+        g_closeAfterStop = true;
+        return;
     }
+    int r = ShowSubWindow(0, L"Capture in progress",
+        L"A memory capture is still running.\n\n"
+        L"If you close RAMstain now, the capture is stopped. The partial image "
+        L"and its .meta file are kept, but no MD5 is computed.\n\n"
+        L"Stop the capture and close RAMstain?",
+        L"Stop and close", L"Keep capturing", L"", 500, 270);
+    if (r != 1) return;
+    g_closeAfterStop = true;
+    if (g_capturing) RequestStop();
 }
 
 static void OnCaptureFinished() {
@@ -1604,6 +1663,11 @@ static void OnCaptureFinished() {
     CaptureResult* r = g_activeResult;
     g_activeResult = nullptr;
     if (g_stopEvent) { CloseHandle(g_stopEvent); g_stopEvent = nullptr; }
+    if (g_closeAfterStop) {           // "Stop and close": files are written, exit
+        g_closeAfterStop = false;
+        DestroyWindow(g_hwnd);
+        return;
+    }
     if (!r) return;
 
     if (r->ok) {
@@ -1730,6 +1794,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_fLabel = f(Sc(10, dpi), FW_SEMIBOLD);
         g_fSmall = f(Sc(12, dpi), FW_NORMAL);
         g_fEdit  = f(Sc(13, dpi), FW_NORMAL);
+        g_fText  = f(Sc(14, dpi), FW_NORMAL);
         HINSTANCE hInst = ((LPCREATESTRUCT)lp)->hInstance;
 
         // Save path edit (custom border drawn in WM_PAINT)
@@ -1836,7 +1901,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // consumer and it re-reads this each time.
             return 0;
         case IDOK:
-        case IDCANCEL:        OnCloseButton(); return 0;
+        case IDCANCEL:        // Esc: same as X - warn if a capture is running
+            if (g_capturing) OnCloseWhileCapturing(); else OnCloseButton();
+            return 0;
         }
         return 0;
     }
@@ -1858,7 +1925,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE:
         if (g_dragging)
             DragMoveWindow(hwnd);
-        TrackHover(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         return 0;
     case WM_LBUTTONUP:
         if (g_dragging) {
@@ -1905,6 +1971,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_APP_FINISHED:
+        if (g_subHwnd) {              // a dialog is open: handle when it closes
+            g_finishPending = true;
+            return 0;
+        }
         OnCaptureFinished();
         return 0;
     case WM_GETMINMAXINFO: {
@@ -1923,7 +1993,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CLOSE:
         if (g_capturing) {
-            OnCloseButton(); // starts a stop
+            OnCloseWhileCapturing(); // warn first; may stop and close later
             return 0;
         }
         DestroyWindow(hwnd);
@@ -1957,7 +2027,7 @@ static void DestroyThemeGfx() {
     if (g_brHeader) DeleteObject(g_brHeader);
     if (g_brWhite) DeleteObject(g_brWhite);
     if (g_penEditBorder) DeleteObject(g_penEditBorder);
-    for (HFONT f : { g_fTitle, g_fBody, g_fLabel, g_fSmall, g_fEdit })
+    for (HFONT f : { g_fTitle, g_fBody, g_fLabel, g_fSmall, g_fEdit, g_fText })
         if (f) DeleteObject(f);
     if (g_hIcon) DestroyIcon(g_hIcon);
 }
