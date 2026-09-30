@@ -1442,6 +1442,9 @@ static void SetBusy(bool busy) {
     EnableWindow(g_editPath, !busy);
     EnableWindow(g_btnBrowse, !busy);
     EnableWindow(g_btnCapture, !busy);
+    // Stop/Close is always clickable when entering either state; OnCloseButton
+    // disables it only while a stop is in progress.
+    EnableWindow(g_btnClose, TRUE);
     if (busy) {
         g_btns[g_btnClose] = BtnState{BtnStyle::Danger, false};
         SetWindowTextW(g_btnClose, L"Stop");
