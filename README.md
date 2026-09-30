@@ -13,10 +13,10 @@ single EXE that you run and that writes the dump straight to a path you choose.
 ## What it does
 
 RAMstain captures the entire contents of physical RAM using the official,
-signed **Velocidex WinPmem** imager (`go-winpmem-signed.exe`). The imager
-temporarily loads its signed kernel driver, writes the image, and unloads the
-driver again. RAMstain drives it from a simple UI and adds the MD5 digest and
-evidence sidecar described below. Nothing is installed permanently.
+signed **Velocidex WinPmem** imager, which is **built into `RAMstain.exe`**.
+The imager temporarily loads its signed kernel driver, writes the image, and
+unloads the driver again. RAMstain drives it from a simple UI and adds the MD5
+digest and evidence sidecar described below. Nothing is installed permanently.
 
 An **experimental driverless path** (`OpenProcess` on PID -1 +
 `ReadProcessMemory`) is still available by unticking **Use WinPmem driver**,
@@ -35,9 +35,11 @@ integrity) is written to both the completion dialog and the `.meta` sidecar.
 
 ## Key properties
 
-- **Small, self-contained EXE.** Statically linked (no VC++ runtime / MFC /
-  redistributable required). ~220 KB. Needs the WinPmem imager
-  (`go-winpmem-signed.exe`) placed next to it for real captures.
+- **Portable single EXE.** Statically linked (no VC++ runtime / MFC /
+  redistributable required), ~800 KB with the WinPmem imager embedded. Copy it
+  to a USB stick and run it; nothing else is needed. The imager is written to
+  a temporary Administrators-only folder only when a capture needs it, and
+  deleted when RAMstain closes (see [Capture methods](#capture-methods)).
 - **Offline by design.** No network calls, no telemetry, no update downloads.
 - **Runs as Administrator** (required to read physical memory).
 - **Progress + Stop.** Live progress bar; the **Close** button becomes **Stop**
@@ -72,35 +74,46 @@ reset the minor, edit the numbers in `src\version.h`; the next build continues
 from there. The bump happens before compiling, so a failed build still uses up
 a number.
 
+### Publishing a GitHub Release
+
+```bat
+release.bat          :: build, commit version.h, tag vX.Y.Z, push, publish release
+release.bat draft    :: same, but the GitHub Release is created as a draft
+```
+
+Requires the [GitHub CLI](https://cli.github.com/) (`gh auth login`) and no
+uncommitted changes. The script builds Release x64, computes the SHA-256 of
+`RAMstain.exe`, shows a summary and asks for confirmation. It then commits
+`src\version.h`, tags `vX.Y.Z`, pushes the branch and tag, and creates the
+release with `RAMstain.exe` attached and the SHA-256 in the release notes. If
+the build fails or you answer N, `src\version.h` is restored, so the version
+number is not used up.
+
 ## Running
 
 ```
 RAMstain.exe
 ```
 
-1. Download `go-winpmem-signed.exe` from the
-   [WinPmem releases](https://github.com/Velocidex/WinPmem/releases) and place
-   it next to `RAMstain.exe`.
-2. Choose the output path (default is `RAMstain_<timestamp>.raw` next to the
+1. Choose the output path (default is `RAMstain_<timestamp>.raw` next to the
    EXE). Use **Browse…** to pick a different location.
-3. Click **Capture**. RAMstain runs as Administrator (UAC prompt at launch),
-   runs the imager, and shows live progress as the image grows.
-4. On completion you get a summary dialog (size, time, speed, MD5) and the
+2. Click **Capture**. RAMstain runs as Administrator (UAC prompt at launch),
+   runs the built-in imager, and shows live progress as the image grows.
+3. On completion you get a summary dialog (size, time, speed, MD5) and the
    option to open the folder.
 
 ### Command line
 
 ```
 RAMstain.exe "D:\evidence\host1.raw"                  :: pre-fill the save path
-RAMstain.exe --driver "C:\tools\go-winpmem-signed.exe" :: use an imager from another location
+RAMstain.exe --driver "C:\tools\go-winpmem-signed.exe" :: use an external imager instead of the built-in one
 RAMstain.exe --no-driver                              :: start with the experimental driverless path selected
 RAMstain.exe --selftest "C:\out\test.raw"             :: run a 512 MiB synthetic pipeline test
 ```
 
-The imager is looked up in this order: `--driver <path>`, then
-`go-winpmem-signed.exe` / `go-winpmem.exe` / `winpmem-go.exe` next to
-`RAMstain.exe`, then the `RAMSTAIN_WINPMEM` environment variable, then
-`C:\RAMstain\go-winpmem-signed.exe`.
+The built-in imager is used unless you override it with `--driver <path>` or
+the `RAMSTAIN_WINPMEM` environment variable (checked in that order). Both
+accept the Go imager or the classic WinPmem 2.x.
 
 `--selftest` writes a known synthetic 512 MiB image through the same
 write → MD5 → sidecar → dialog pipeline as the driverless path. It is a way to
@@ -112,8 +125,14 @@ memory. The `.meta` sidecar is clearly marked `SELF-TEST synthetic source`.
 ## Capture methods
 
 **WinPmem driver (default).** Reading physical memory on Windows requires
-kernel code, so the supported method is the signed WinPmem driver. During a
-capture the imager creates a temporary `winpmem` service, loads the driver,
+kernel code, so the supported method is the signed WinPmem driver. The
+WinPmem imager (2.0.1, signed by Velocidex) is embedded in `RAMstain.exe`. On
+the first driver-mode capture it is written to `%TEMP%\RAMstain-<pid>\`, a
+folder whose permissions allow only Administrators and SYSTEM, so a
+non-elevated process cannot replace the file before RAMstain runs it. The
+folder is deleted when RAMstain closes (also on logoff/shutdown), and folders
+left behind by a crashed instance are removed at the next start. During a
+capture the imager creates a temporary driver service, loads the driver,
 writes the image, and removes the service again. RAMstain also runs the
 imager's unload command afterwards as a safety net. Both the Go imager
 (`go-winpmem`, `acquire <file>`) and the classic C++ WinPmem 2.x
@@ -140,16 +159,21 @@ tested on other systems.
 RAMstain.sln            Visual Studio solution
 RAMstain.vcxproj        project (v143 / x64, static CRT, UAC + themed manifest)
 build.bat               MSBuild wrapper (app + local tools)
+release.bat             build + tag + publish a GitHub Release (SHA-256 in notes)
 src/
   RAMstain.cpp          the entire application (UI + capture engine)
   md5.h                 small self-contained MD5 (for capture integrity only)
   legal.h               Disclaimer / Privacy Policy / Terms of Use text
-  ramstain.rc           resources (icon, version info)
+  ramstain.rc           resources (icon, version info, embedded WinPmem + license)
   version.h             version numbers (rewritten by scripts\bump-version.ps1 each build)
   RAMstain.ico          app icon
   RAMstain.manifest     DPI awareness + Common Controls v6 (UAC requireAdministrator is set in RAMstain.vcxproj)
 scripts/
   bump-version.ps1      pre-build step: increments the minor version
+third_party/winpmem/
+  winpmem_x64.exe       signed WinPmem 2.0.1 imager, embedded into RAMstain.exe
+  LICENSE               WinPmem's Apache 2.0 license (also embedded, shown in Terms of Use)
+  README.md             provenance: version, signer, SHA-256, how to update
 .gitignore              excludes build output, captures (*.raw/*.meta), notes
 ```
 
@@ -178,6 +202,13 @@ Method:      WinPmem kernel driver (Velocidex signed driver)
 ```
 
 ---
+
+## Third-party software
+
+RAMstain embeds the [WinPmem](https://github.com/Velocidex/WinPmem) memory
+imager, Copyright 2012 Michael Cohen, licensed under the
+[Apache License 2.0](third_party/winpmem/LICENSE). The full license text is
+shown in the app under **Terms of Use → Third-party software**.
 
 ## Legal
 

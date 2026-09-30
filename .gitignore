@@ -77,3 +77,6 @@ tools/
 Thumbs.db
 desktop.ini
 *.log
+
+# Embedded third-party binary (WinPmem imager) - tracked on purpose
+!third_party/winpmem/*.exe

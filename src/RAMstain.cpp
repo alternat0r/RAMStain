@@ -37,6 +37,7 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <process.h>
+#include <sddl.h>
 #include <string>
 #include <vector>
 #include <map>
@@ -49,6 +50,7 @@
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // WM_DRAWITEM: the control type is in DRAWITEMSTRUCT->CtlType, not wParam.
 // The SDK does not define DT_BUTTON; empirically CtlType == 4 for BS_OWNERDRAW
@@ -415,9 +417,8 @@ static void RunCapture(CaptureResult* res, bool selftest) {
                     L"on " + os + L".\n\n"
                     L"Error 87 is what Windows returns for any process ID that does not "
                     L"exist; PID -1 is not a documented physical-memory handle.\n\n"
-                    L"Use the WinPmem driver instead: tick 'Use WinPmem driver' and place "
-                    L"'go-winpmem-signed.exe' next to RAMstain.exe.\n"
-                    L"Download: https://github.com/Velocidex/WinPmem/releases";
+                    L"Use the WinPmem driver instead: tick 'Use WinPmem driver' "
+                    L"(the imager is built into RAMstain).";
             } else if (code == ERROR_ACCESS_DENIED) {
                 res->error =
                     L"Physical-memory access denied (error " +
@@ -522,39 +523,197 @@ static void RunCapture(CaptureResult* res, bool selftest) {
 // ---------------------------------------------------------------------------
 //  WinPmem driver capture (the default method).
 //
-//  Shells out to the official signed Velocidex WinPmem Go imager, which embeds
-//  its own signed kernel driver: it installs/starts the service, writes the
-//  .raw image, then uninstalls itself. We compute the MD5 over the resulting
-//  file and write the same .meta sidecar as the driverless path.
+//  Runs the signed Velocidex WinPmem imager, which loads its own signed kernel
+//  driver, writes the .raw image, then unloads it. We compute the MD5 over the
+//  resulting file and write the same .meta sidecar as the driverless path.
+//
+//  The imager is embedded in RAMstain.exe (IDR_WINPMEM, third_party/winpmem/).
+//  It is written to disk only when a driver-mode capture needs it, into
+//  %TEMP%\RAMstain-<pid>\ - a folder whose ACL allows only Administrators and
+//  SYSTEM, so a non-elevated process cannot swap the file before we run it
+//  elevated - and that folder is deleted when RAMstain exits. Folders left by
+//  a crashed instance are swept at the next start.
+//
+//  An external imager can still be used instead of the embedded one:
+//    1. --driver <path> on the command line
+//    2. %RAMSTAIN_WINPMEM% environment variable (a path to the exe)
 // ---------------------------------------------------------------------------
-// Locate the WinPmem Go imager (signed). Search order:
-//   1. g_driverPath (from --driver <path>)
-//   2. go-winpmem-signed.exe / go-winpmem.exe next to RAMstain.exe
-//   3. %RAMSTAIN_WINPMEM% environment variable (a path to the exe)
-//   4. C:\RAMstain\go-winpmem-signed.exe
-static std::wstring FindWinPmemImager() {
-    if (!g_driverPath.empty()) {
-        if (GetFileAttributesW(g_driverPath.c_str()) != INVALID_FILE_ATTRIBUTES)
-            return g_driverPath;
-        return L""; // explicit path given but missing
-    }
-    std::wstring exeDir = GetExeDir();
-    std::vector<std::wstring> candidates = {
-        exeDir + L"\\go-winpmem-signed.exe",
-        exeDir + L"\\go-winpmem.exe",
-        exeDir + L"\\winpmem-go.exe",
-    };
-    for (const auto& c : candidates)
-        if (GetFileAttributesW(c.c_str()) != INVALID_FILE_ATTRIBUTES)
-            return c;
+static std::wstring g_dropDir;      // extraction folder (empty = nothing extracted)
+static std::wstring g_dropImager;   // extracted imager path (reused for later captures)
+
+// External imager override, if one was given (--driver or RAMSTAIN_WINPMEM).
+static bool GetImagerOverride(std::wstring& path) {
+    if (!g_driverPath.empty()) { path = g_driverPath; return true; }
     wchar_t env[MAX_PATH];
-    if (GetEnvironmentVariableW(L"RAMSTAIN_WINPMEM", env, MAX_PATH) > 0 &&
-        GetFileAttributesW(env) != INVALID_FILE_ATTRIBUTES)
-        return env;
-    std::wstring c4 = L"C:\\RAMstain\\go-winpmem-signed.exe";
-    if (GetFileAttributesW(c4.c_str()) != INVALID_FILE_ATTRIBUTES)
-        return c4;
-    return L"";
+    DWORD n = GetEnvironmentVariableW(L"RAMSTAIN_WINPMEM", env, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) { path = env; return true; }
+    return false;
+}
+
+static bool HasEmbeddedImager() {
+    return FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_WINPMEM), RT_RCDATA) != nullptr;
+}
+
+// UI pre-check before a driver-mode capture: empty string = an imager is
+// available, otherwise a user-facing explanation.
+static std::wstring CheckImagerAvailable() {
+    std::wstring ovr;
+    if (GetImagerOverride(ovr)) {
+        if (GetFileAttributesW(ovr.c_str()) != INVALID_FILE_ATTRIBUTES) return L"";
+        return L"The external WinPmem imager given with --driver or the "
+               L"RAMSTAIN_WINPMEM environment variable was not found:\n" + ovr +
+               L"\n\nRemove the override to use the imager built into RAMstain.";
+    }
+    if (HasEmbeddedImager()) return L"";
+    return L"This RAMstain build does not contain the embedded WinPmem imager.\n\n"
+           L"Pass an external imager:  RAMstain.exe --driver C:\\path\\winpmem.exe";
+}
+
+static std::wstring TempDir() {
+    wchar_t buf[MAX_PATH + 1] = L"";
+    DWORD n = GetTempPathW(MAX_PATH + 1, buf);
+    std::wstring t = (n > 0 && n <= MAX_PATH) ? std::wstring(buf, n) : L"C:\\Windows\\Temp\\";
+    if (t.back() != L'\\') t.push_back(L'\\');
+    return t;
+}
+
+static std::wstring DropDirForPid(DWORD pid) {
+    return TempDir() + L"RAMstain-" + std::to_wstring(pid);
+}
+
+// Delete every file in `dir`, then the folder. Retries briefly because the
+// imager may have exited only moments ago and still hold its image mapped.
+static bool DeleteDropDir(const std::wstring& dir) {
+    WIN32_FIND_DATAW fd;
+    HANDLE hf = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (hf != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring f = dir + L"\\" + fd.cFileName;
+            SetFileAttributesW(f.c_str(), FILE_ATTRIBUTE_NORMAL);
+            for (int i = 0; i < 20 && !DeleteFileW(f.c_str()) &&
+                            GetLastError() != ERROR_FILE_NOT_FOUND; ++i)
+                Sleep(100);
+        } while (FindNextFileW(hf, &fd));
+        FindClose(hf);
+    }
+    for (int i = 0; i < 20; ++i) {
+        if (RemoveDirectoryW(dir.c_str())) return true;
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return true;
+        Sleep(100);
+    }
+    return false;
+}
+
+static bool IsProcessAlive(DWORD pid) {
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return GetLastError() == ERROR_ACCESS_DENIED; // exists, just not ours
+    bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
+}
+
+// Remove %TEMP%\RAMstain-<pid> folders left behind by instances that are no
+// longer running (e.g. RAMstain crashed or was killed mid-capture).
+static void SweepStaleDropDirs() {
+    std::wstring tmp = TempDir();
+    WIN32_FIND_DATAW fd;
+    HANDLE hf = FindFirstFileW((tmp + L"RAMstain-*").c_str(), &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    DWORD self = GetCurrentProcessId();
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        const wchar_t* digits = fd.cFileName + 9;   // after "RAMstain-"
+        if (!*digits || wcsspn(digits, L"0123456789") != wcslen(digits)) continue;
+        DWORD pid = (DWORD)wcstoul(digits, nullptr, 10);
+        if (pid == self || IsProcessAlive(pid)) continue;
+        DeleteDropDir(tmp + fd.cFileName);
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+}
+
+// Called when RAMstain exits: remove the extracted imager and its folder.
+static void CleanupDroppedImager() {
+    if (!g_dropDir.empty()) DeleteDropDir(g_dropDir);
+    g_dropDir.clear();
+    g_dropImager.clear();
+}
+
+// Write the embedded imager into the protected drop folder (once per run).
+static std::wstring ExtractEmbeddedImager(std::wstring& err) {
+    if (!g_dropImager.empty() &&
+        GetFileAttributesW(g_dropImager.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return g_dropImager;
+
+    HRSRC hr = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_WINPMEM), RT_RCDATA);
+    HGLOBAL hg = hr ? LoadResource(nullptr, hr) : nullptr;
+    const void* data = hg ? LockResource(hg) : nullptr;
+    DWORD size = hr ? SizeofResource(nullptr, hr) : 0;
+    if (!data || size == 0) {
+        err = L"The embedded WinPmem imager could not be loaded from RAMstain.exe.";
+        return L"";
+    }
+
+    std::wstring dir = DropDirForPid(GetCurrentProcessId());
+    if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES)
+        DeleteDropDir(dir);   // stale folder from an earlier process with our PID
+
+    // Protected DACL: full control for Administrators and SYSTEM only, no
+    // inheritance from %TEMP% (the "P" flag). Files created inside inherit it.
+    PSECURITY_DESCRIPTOR psd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)", SDDL_REVISION_1, &psd, nullptr)) {
+        err = L"Could not build the security descriptor for the imager folder (error " +
+              std::to_wstring(GetLastError()) + L").";
+        return L"";
+    }
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), psd, FALSE };
+    BOOL made = CreateDirectoryW(dir.c_str(), &sa);
+    DWORD mkErr = GetLastError();
+    LocalFree(psd);
+    if (!made) {
+        err = L"Could not create the imager folder (error " + std::to_wstring(mkErr) +
+              L"):\n" + dir;
+        return L"";
+    }
+    g_dropDir = dir;   // from here on, exit cleanup removes it
+
+    std::wstring file = dir + L"\\winpmem_x64.exe";
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        err = L"Could not write the embedded WinPmem imager (error " +
+              std::to_wstring(GetLastError()) + L"):\n" + file;
+        return L"";
+    }
+    DWORD wr = 0;
+    BOOL ok = WriteFile(h, data, size, &wr, nullptr) && wr == size;
+    DWORD wErr = GetLastError();
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(file.c_str());
+        err = L"Could not write the embedded WinPmem imager (error " +
+              std::to_wstring(wErr) + L"):\n" + file +
+              L"\n\nAn antivirus product may have blocked or removed it.";
+        return L"";
+    }
+    g_dropImager = file;
+    return file;
+}
+
+// The imager to run for this capture: the external override if one was given,
+// otherwise the embedded one (extracted on first use).
+static std::wstring ResolveImager(bool& embedded, std::wstring& err) {
+    std::wstring ovr;
+    if (GetImagerOverride(ovr)) {
+        embedded = false;
+        if (GetFileAttributesW(ovr.c_str()) != INVALID_FILE_ATTRIBUTES) return ovr;
+        err = L"External WinPmem imager not found:\n" + ovr;
+        return L"";
+    }
+    embedded = true;
+    return ExtractEmbeddedImager(err);
 }
 
 static DWORD WaitForAnyStop(DWORD, DWORD ms) {
@@ -666,17 +825,12 @@ static ImagerKind DetectImagerKind(const std::wstring& imager, const std::wstrin
 
 // Run the WinPmem imager to produce res->path, then hash + write meta.
 static void RunDriverCapture(CaptureResult* res) {
-    std::wstring imager = FindWinPmemImager();
+    bool embedded = true;
+    std::wstring resolveErr;
+    std::wstring imager = ResolveImager(embedded, resolveErr);
     if (imager.empty()) {
         res->errCode = 0;
-        res->error =
-            L"WinPmem imager not found.\n\n"
-            L"Driver mode uses the official signed Velocidex WinPmem Go imager.\n"
-            L"Place 'go-winpmem-signed.exe' next to RAMstain.exe, or:\n"
-            L"  * pass it on the command line:  RAMstain.exe --driver C:\\path\\go-winpmem-signed.exe\n"
-            L"  * or set the environment variable RAMSTAIN_WINPMEM to its full path.\n\n"
-            L"Download: https://github.com/Velocidex/WinPmem/releases\n"
-            L"(use the go-winpmem ... signed ... exe)";
+        res->error = L"WinPmem imager unavailable.\n\n" + resolveErr;
         return;
     }
 
@@ -685,7 +839,8 @@ static void RunDriverCapture(CaptureResult* res) {
     std::wstring imagerDir = (sl == std::wstring::npos) ? L"." : imager.substr(0, sl);
 
     ImagerKind kind = DetectImagerKind(imager, imagerDir);
-    std::wstring kindName = (kind == ImagerKind::Go) ? L"go-winpmem" : L"WinPmem 2.x";
+    std::wstring kindName = std::wstring((kind == ImagerKind::Go) ? L"go-winpmem" : L"WinPmem 2.x") +
+                            (embedded ? L", embedded" : L", external");
     std::wstring cmdline = (kind == ImagerKind::Go)
         ? L"\"" + imager + L"\" acquire \"" + res->path + L"\""
         : L"\"" + imager + L"\" \"" + res->path + L"\"";
@@ -1342,15 +1497,11 @@ static void OnCapture() {
     // Driver mode (default): the checkbox, initialised from the command line.
     g_driverMode = (!g_selftest &&
                     (SendMessageW(g_chkDriver, BM_GETCHECK, 0, 0) == BST_CHECKED));
-    if (g_driverMode && FindWinPmemImager().empty()) {
+    std::wstring imagerProblem = g_driverMode ? CheckImagerAvailable() : L"";
+    if (!imagerProblem.empty()) {
         // No imager available. Let the user either fall back to driverless or cancel.
         int r = ShowSubWindow(0, L"WinPmem imager not found",
-            L"The 'Use WinPmem driver' option is enabled, but no WinPmem Go imager "
-            L"was found.\n\n"
-            L"Place 'go-winpmem-signed.exe' next to RAMstain.exe, or:\n"
-            L"  • pass it:  RAMstain.exe --driver C:\\path\\go-winpmem-signed.exe\n"
-            L"  • set the RAMSTAIN_WINPMEM environment variable to its full path.\n\n"
-            L"Download: https://github.com/Velocidex/WinPmem/releases\n\n"
+            imagerProblem + L"\n\n"
             L"You can try the experimental driverless method instead, but it is "
             L"not a documented Windows API and is expected to fail.",
             L"OK", L"Try driverless", L"", 520, 360);
@@ -1387,8 +1538,10 @@ static void OnCapture() {
     if (g_driverMode && !g_driverWarned) {
         int r = ShowSubWindow(0, L"Driver mode",
             L"Driver mode will:\n"
+            L"  • write the built-in WinPmem imager to a protected temporary "
+            L"folder (deleted when RAMstain closes)\n"
             L"  • temporarily load the signed WinPmem kernel driver\n"
-            L"  • create and remove a 'winpmem' Windows service\n"
+            L"  • create and remove a temporary Windows driver service\n"
             L"  • capture the full physical memory to your chosen path\n\n"
             L"RAMstain is already running as Administrator.\n\nContinue?",
             L"Capture with driver", L"Cancel", L"", 500, 300);
@@ -1483,6 +1636,32 @@ static void OnCaptureFinished() {
     }
 }
 
+// Third-party notice shown at the end of the Terms of Use: the embedded
+// WinPmem imager is Apache 2.0, which requires shipping its license text.
+static std::wstring ThirdPartyNotice() {
+    std::wstring s =
+        L"\n\n"
+        L"THIRD-PARTY SOFTWARE\n"
+        L"====================\n"
+        L"\n"
+        L"RAMstain includes the WinPmem memory imager, Copyright 2012 Michael Cohen "
+        L"<scudette@gmail.com>, distributed by Velocidex "
+        L"(https://github.com/Velocidex/WinPmem). WinPmem is licensed under the "
+        L"Apache License, Version 2.0, reproduced below. It is not covered by "
+        L"sections 5 and 6 of these Terms; its own license applies to it.\n"
+        L"\n";
+    HRSRC hr = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_WINPMEM_LICENSE), RT_RCDATA);
+    HGLOBAL hg = hr ? LoadResource(nullptr, hr) : nullptr;
+    const char* p = hg ? (const char*)LockResource(hg) : nullptr;
+    DWORD n = hr ? SizeofResource(nullptr, hr) : 0;
+    if (p && n)
+        s += Utf8ToWide(std::string(p, n));
+    else
+        s += L"(License text missing from this build: see "
+             L"http://www.apache.org/licenses/LICENSE-2.0)";
+    return s;
+}
+
 static void OnLegalDoc(int which) {
     switch (which) {
     case IDC_BTN_DISC:
@@ -1495,7 +1674,7 @@ static void OnLegalDoc(int which) {
         break;
     case IDC_BTN_TERMS:
         ShowSubWindow(0, L"RAMstain - Terms of Use",
-                      Utf8ToWide(kLegalTerms), L"Close", L"", L"", 620, 460);
+                      Utf8ToWide(kLegalTerms) + ThirdPartyNotice(), L"Close", L"", L"", 620, 460);
         break;
     }
 }
@@ -1750,6 +1929,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_subHwnd && IsWindow(g_subHwnd)) DestroyWindow(g_subHwnd);
         PostQuitMessage(0);
         return 0;
+    case WM_ENDSESSION:
+        // Logoff/shutdown can end the process without returning from the
+        // message loop, so remove the extracted imager here as well.
+        if (wp) CleanupDroppedImager();
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -1819,6 +2003,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
 
+    // Remove imager folders left in %TEMP% by RAMstain instances that crashed.
+    SweepStaleDropDirs();
+
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_PROGRESS_CLASS;
@@ -1886,6 +2073,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    CleanupDroppedImager();   // delete the extracted WinPmem imager + its folder
     DestroyThemeGfx();
     return (int)m.wParam;
 }

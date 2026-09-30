@@ -4,6 +4,11 @@
 
 IDI_RAMSTAIN ICON "RAMstain.ico"
 
+// Embedded WinPmem imager (signed, Apache 2.0) and its license text.
+// Paths are relative to this .rc file (src/).
+IDR_WINPMEM         RCDATA "../third_party/winpmem/winpmem_x64.exe"
+IDR_WINPMEM_LICENSE RCDATA "../third_party/winpmem/LICENSE"
+
 1 VERSIONINFO
 FILEVERSION     RAMSTAIN_VER_MAJOR,RAMSTAIN_VER_MINOR,RAMSTAIN_VER_PATCH,0
 PRODUCTVERSION  RAMSTAIN_VER_MAJOR,RAMSTAIN_VER_MINOR,RAMSTAIN_VER_PATCH,0
