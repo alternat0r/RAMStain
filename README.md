@@ -20,18 +20,21 @@ hand, often under time pressure.
 
 RAMstain puts a simple window on top of WinPmem, so a capture is **point and
 click**: choose where to save, click **Capture**, and get the image, its
-SHA-256 hash, and a ready-made evidence note (`.meta`) in one go. The goal is to save
-forensic analysts time and avoid mistakes, not to replace WinPmem.
+SHA-256 hash, a ready-made evidence note (`.meta`) and a run log in one go.
+The goal is to save forensic analysts time and avoid mistakes, not to replace
+WinPmem.
 
 ---
 
 ## Features
 
-- **Portable single EXE** (~800 KB). No installer, no runtime to install. The
+- **Portable single EXE** (~900 KB). No installer, no runtime to install. The
   signed [WinPmem](#credits) imager is built in.
 - **Offline.** No network calls, no telemetry, no updates.
 - **Evidence-ready output.** A `.raw` image plus a `.meta` sidecar with host,
-  OS, timestamp, size and SHA-256.
+  OS, timestamp, size and SHA-256, and a timestamped `.log` of the whole run.
+- **Copy hashes** from the result window in `sha256sum` format, for case notes
+  or later verification.
 - **Split images** into 1–16 GB parts (`.001`, `.002`, …), including a
   FAT32-safe 4 GB option.
 - **Live progress** for the capture and the hashing step, with **Stop** at any
@@ -118,7 +121,7 @@ Finished:    2026-09-28T08:42:51Z  (local 2026-09-28 16:42:51 UTC+08:00)
 Size:        34359738368 bytes
 Pages:       8388608 x 4096 bytes
 SHA-256:     adc0a545e4ddbfc76f87b9eca80d0ab066bf9f9dd1f8390e1306f85a7bbf84fa
-Tool:        RAMstain 1.9.0
+Tool:        RAMstain 1.42.0
 Method:      WinPmem kernel driver (WinPmem 2.x, embedded, Velocidex signed driver)
 ```
 
@@ -164,9 +167,10 @@ apply. The files are named after the save path, e.g. `host1__pagefile.raw`.
   copy reflects their contents at the time each part is read. The volume must
   be NTFS.
 - The pagefile is located from the system's `ExistingPageFiles` setting (it may
-  live on any volume); the hibernation file and swapfile from the system volume. If a file does
-  not exist — the pagefile or hibernation is disabled — the run notes it and
-  writes a `.meta` sidecar recording that nothing was collected.
+  live on any volume); the hibernation file and swapfile from the system
+  volume. If a file does not exist (the pagefile or hibernation is disabled, or
+  Windows has not created a swapfile), the run notes it and writes a `.meta`
+  sidecar recording that nothing was collected.
 - Collection is independent of the memory capture: a system file is still
   collected (and reported) even if the memory image itself fails or is
   stopped. Stopping during collection discards the partial system file.
@@ -223,7 +227,8 @@ RAMstain is built on **[WinPmem](https://github.com/Velocidex/WinPmem)**, the
 open-source Windows memory imager by **Michael Cohen**, maintained by
 **[Velocidex](https://github.com/Velocidex)**. WinPmem does the actual work of
 reading physical memory through its signed kernel driver; RAMstain adds the
-interface, integrity hashing, evidence sidecar and image splitting.
+interface, integrity hashing, evidence sidecar, run log, image splitting and
+system-file collection.
 
 The embedded imager is WinPmem 2.0.1, signed by Velocidex Innovations, and is
 included unmodified under the [Apache License 2.0](third_party/winpmem/LICENSE)
