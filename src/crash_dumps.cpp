@@ -116,7 +116,7 @@ private:
 }  // namespace
 
 const wchar_t* DumpKindName(DumpKind k) {
-    return k == DumpKind::Minidump ? L"Minidump" : k == DumpKind::System ? L"System crash dump" : L"App crash dump";
+    return k == DumpKind::Minidump ? L"Minidump" : k == DumpKind::System ? L"Sys crash dump" : L"App crash dump";
 }
 
 std::vector<DumpSource> FindCrashDumps(bool minidumps, bool system, bool app, std::vector<std::wstring>* searched) {

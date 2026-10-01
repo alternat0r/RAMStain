@@ -270,7 +270,7 @@ Hover over a checkbox to see where it looks.
 | Option | Looks in |
 |--------|----------|
 | **Minidumps** | `CrashControl\MinidumpDir` (default `%SystemRoot%\Minidump`) |
-| **System crash dump** | `CrashControl\DumpFile` (default `%SystemRoot%\MEMORY.DMP`), `%SystemRoot%\LiveKernelReports`, and kernel (`Kernel_*`) Windows Error Reporting reports |
+| **Sys crash dump** | `CrashControl\DumpFile` (default `%SystemRoot%\MEMORY.DMP`), `%SystemRoot%\LiveKernelReports`, and kernel (`Kernel_*`) Windows Error Reporting reports |
 | **App crash dumps** | every profile's `AppData\Local\CrashDumps` (users, plus the system and service accounts), the Windows Error Reporting report archive and queue (machine-wide and per user), and any `LocalDumps` `DumpFolder` set in the registry |
 
 `.dmp`, `.mdmp` and `.hdmp` files are collected; junctions are not followed.

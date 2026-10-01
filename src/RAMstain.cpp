@@ -1545,7 +1545,7 @@ static void CollectCrashDumps(CaptureResult* res) {
     for (const DumpCapture& c : res->dumps) if (!c.path.empty()) ++ok;
     std::wstring requested;
     if (g_collectMinidumps) requested += L"minidumps";
-    if (g_collectSysDump) requested += (requested.empty() ? L"" : L", ") + std::wstring(L"system crash dumps");
+    if (g_collectSysDump) requested += (requested.empty() ? L"" : L", ") + std::wstring(L"Sys crash dumps");
     if (g_collectAppDumps) requested += (requested.empty() ? L"" : L", ") + std::wstring(L"app crash dumps");
     std::wstring m;
     m += L"RAMstain crash dump collection\n";
@@ -2677,6 +2677,10 @@ static void DrawMain(HDC dc, HWND hwnd) {
     // Collect group: "COLLECT" caption (g_lblCollect) over a white rounded
     // panel (y 264..324) holding two rows of checkboxes (child controls).
     DrawRoundRect(dc, { S(kPad), S(264), W - S(kPad), S(324) }, S(6), g_brWhite, g_penEditBorder);
+    {   // divider between row 1 (memory image, system files) and row 2 (crash dumps)
+        RECT d = { S(kPad + 10), S(294), W - S(kPad + 10), S(294) + 1 };
+        FillRect(dc, &d, g_brLine);
+    }
 
     // Progress percentage (the bar itself is a child control) and status line.
     int pr = g_progress ? (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0) : 0;
@@ -2799,7 +2803,7 @@ static void LogRunStart(const std::wstring& path, UINT64 freeBytes) {
     add(g_collectHiberfil, L"hiberfil.sys");
     add(g_collectSwapfile, L"swapfile.sys");
     add(g_collectMinidumps, L"minidumps");
-    add(g_collectSysDump, L"system crash dumps");
+    add(g_collectSysDump, L"sys crash dumps");
     add(g_collectAppDumps, L"app crash dumps");
     g_log.Line(std::wstring(L"==== RAMstain ") + kVersionStr + L" run started ====\n"
                L"Time:        " + FormatUtcAndLocal(FILETIME{}) + L"\n"
@@ -3003,7 +3007,7 @@ static void OnCapture() {
         g_dumpSources = FindCrashDumps(g_collectMinidumps, g_collectSysDump, g_collectAppDumps, &g_dumpSearched);
         struct { DumpKind k; bool want; const wchar_t* label; } kKinds[] = {
             { DumpKind::Minidump, g_collectMinidumps, L"Minidumps:" },
-            { DumpKind::System,   g_collectSysDump,   L"System crash dumps:" },
+            { DumpKind::System,   g_collectSysDump,   L"Sys crash dumps:" },
             { DumpKind::App,      g_collectAppDumps,  L"App crash dumps:" },
         };
         for (const auto& kk : kKinds) {
@@ -3647,7 +3651,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         // Default on (the driver is the primary method); --no-driver clears it.
-        g_chkDriver = CreateWindowExW(0, L"BUTTON", L"Use WinPmem &driver (recommended)",
+        g_chkDriver = CreateWindowExW(0, L"BUTTON", L"Use WinPmem &driver",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
                                       S(kCol2), S(215), S(W - kPad - kCol2), S(22),
                                       hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
@@ -3673,17 +3677,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             { &g_chkHiberfil, L"&Hibernation file", IDC_CHK_HIBERFIL, g_cliCollectHiberfil && !g_selftest },
             { &g_chkSwapfile, L"S&wapfile",        IDC_CHK_SWAPFILE, g_cliCollectSwapfile && !g_selftest },
             { &g_chkMinidumps, L"Mi&nidumps",      IDC_CHK_MINIDUMPS, g_cliMinidumps && !g_selftest },
-            { &g_chkSysDump,  L"S&ystem crash dump", IDC_CHK_SYSDUMP, g_cliSysDump && !g_selftest },
+            { &g_chkSysDump,  L"S&ys crash dump",  IDC_CHK_SYSDUMP,  g_cliSysDump && !g_selftest },
             { &g_chkAppDumps, L"App c&rash dumps", IDC_CHK_APPDUMPS, g_cliAppDumps && !g_selftest },
         };
-        // Row 1 on the 120px grid; row 2: Minidumps, then "System crash dump"
-        // across two columns (too long for one), then App crash dumps.
-        static const int kX[7] = { 0, 120, 240, 360, 0, 120, 360 };
-        static const int kW[7] = { 112, 112, 112, 104, 112, 232, 116 };
+        // Both rows on the same 120px grid (row 2 lines up under row 1); a
+        // divider drawn in DrawMain separates them.
         for (int c = 0; c < 7; ++c) {
+            int col = c % 4, row = c / 4;
             HWND h = CreateWindowExW(0, L"BUTTON", kCollect[c].text,
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                     S(kPad + 12 + kX[c]), S(269 + 28 * (c / 4)), S(kW[c]), S(22),
+                                     S(kPad + 12 + 120 * col), S(268 + 30 * row), S(col < 3 ? 112 : 104), S(22),
                                      hwnd, (HMENU)(INT_PTR)kCollect[c].id, hInst, nullptr);
             SendMessageW(h, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
             SendMessageW(h, BM_SETCHECK, kCollect[c].on ? BST_CHECKED : BST_UNCHECKED, 0);
