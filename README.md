@@ -10,6 +10,33 @@ pick where to save, click **Capture**.
   <img src="docs/screenshot.png" alt="RAMstain main window" width="536">
 </p>
 
+> [!WARNING]
+> **Release builds are not code-signed.** `RAMstain.exe` on the
+> [Releases](https://github.com/alternat0r/RAMstain/releases) page has no Authenticode signature, so
+> Windows shows **"Unknown publisher"** at the administrator prompt and
+> SmartScreen or antivirus software may warn about or block it. Verify the
+> download before running it - see [Download and code signing](#download-and-code-signing).
+
+## Contents
+
+- [Why RAMstain?](#why-ramstain)
+- [Features](#features)
+- [Download and code signing](#download-and-code-signing)
+- [Usage](#usage)
+  - [Keyboard](#keyboard)
+  - [Command line](#command-line)
+- [Output](#output)
+- [Splitting large images](#splitting-large-images)
+- [Collecting the pagefile, hibernation file and swapfile](#collecting-the-pagefile-hibernation-file-and-swapfile)
+- [Collecting crash dumps](#collecting-crash-dumps)
+- [How it captures](#how-it-captures)
+- [Building](#building)
+  - [Repository layout](#repository-layout)
+- [Reporting issues](#reporting-issues)
+- [Credits](#credits)
+- [Legal and privacy](#legal-and-privacy)
+- [License](#license)
+
 ## Why RAMstain?
 
 [WinPmem](#credits) is an excellent, trusted memory imager, but it is
@@ -58,6 +85,42 @@ WinPmem.
   with a stronger warning on the Windows drive.
 - **Safety checks:** each run in its own new folder (nothing is overwritten),
   and a warning if you close the window during a capture.
+
+## Download and code signing
+
+Download `RAMstain.exe` from the [Releases](https://github.com/alternat0r/RAMstain/releases) page,
+or [build it yourself](#building) from this source.
+
+**The release EXE is not code-signed** (it has no Authenticode certificate).
+What that means in practice:
+
+- The administrator (UAC) prompt shows **"Unknown publisher"** instead of a
+  verified name.
+- **SmartScreen** may show *"Windows protected your PC"* for a freshly
+  downloaded copy. After verifying the file (below), choose **More info ->
+  Run anyway**, or clear the download mark with *Properties -> Unblock*.
+- **Antivirus / EDR** products may warn about or quarantine it: a tool that
+  loads a kernel driver, reads physical memory and reads the disk directly
+  looks a lot like what they are built to stop. Allow it only after verifying
+  it, and preferably only for the duration of the collection.
+
+The embedded WinPmem imager and its kernel driver *are* signed by Velocidex;
+only `RAMstain.exe` itself is unsigned.
+
+**Verify the download** before you run it, and before you copy it to a
+machine you are investigating. Compare its SHA-256 with the one published
+for that release:
+
+```
+certutil -hashfile RAMstain.exe SHA256
+```
+```powershell
+Get-FileHash .\RAMstain.exe -Algorithm SHA256
+```
+
+If they do not match, do not run it. For casework, keep the verified copy on
+your own trusted media and note its hash and version (also recorded in every
+`.meta` sidecar) in your case notes.
 
 ## Usage
 
@@ -326,6 +389,7 @@ src/                  application source:
   ntfs_raw.*            raw NTFS reader for locked files (pagefile, hibernation, swapfile)
   hash_pipeline.h       SHA-256 on background threads (whole image + split parts)
   verify.*              --verify
+  crash_dumps.*         finding Windows-created crash dumps
   run_log.h             the <name>.log run log
   sha256.h, util.h      SHA-256 via Windows CNG; string helpers
   legal.h, resources    in-app legal text, icon, version resource
@@ -336,6 +400,28 @@ LICENSE               MIT license (RAMstain)
 ```
 
 ---
+
+## Reporting issues
+
+Found a bug, a capture that failed, or something unclear? Please open an issue
+on GitHub: **[github.com/alternat0r/RAMstain/issues](https://github.com/alternat0r/RAMstain/issues)**.
+
+Helpful to include:
+
+- the RAMstain version (title bar, or **About** via F1),
+- the Windows version and build (shown in the main window),
+- what you did and what happened - the exact message text or a screenshot,
+- the run log (`<name>.log`) and, if relevant, the `.meta` sidecar.
+
+**Remove sensitive details first.** The run log and `.meta` files contain the
+computer name, your Windows user name, file paths and any case details you
+entered - edit or redact them before attaching. **Never attach memory images,
+pagefile / hibernation / swap files, or crash dumps**: they can contain
+passwords, keys and personal data.
+
+**Security vulnerabilities:** please do not open a public issue. Report them
+privately through GitHub's private vulnerability reporting (the repository's
+**Security** tab -> **Report a vulnerability**).
 
 ## Credits
 
