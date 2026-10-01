@@ -1,10 +1,10 @@
 // RAMstain version - single source of truth for the EXE version resource
 // (ramstain.rc), the UI footer and the .meta sidecar (RAMstain.cpp).
 //
-// GENERATED: scripts\bump-version.ps1 rewrites this file before every build
-// (MSBuild PreBuildEvent), incrementing the minor number. To change the major
-// version or reset the minor, edit the numbers below; the next build continues
-// from them.
+// GENERATED: scripts\bump-version.ps1 rewrites this file for a release
+// (build.bat bump), incrementing the minor number. Ordinary builds leave it
+// alone. To change the major version or reset the minor, edit the numbers
+// below; the next bump continues from them.
 #ifndef RAMSTAIN_VERSION_H
 #define RAMSTAIN_VERSION_H
 

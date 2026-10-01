@@ -1,9 +1,9 @@
 # =============================================================================
-#  RAMstain - bump the minor version before each build.
+#  RAMstain - bump the minor version for a release.
 #
-#  Called by the MSBuild PreBuildEvent in RAMstain.vcxproj (so it runs for
-#  build.bat and Visual Studio builds alike). Reads src\version.h, increments
-#  RAMSTAIN_VER_MINOR, resets RAMSTAIN_VER_PATCH to 0, and rewrites the file.
+#  Run by `build.bat bump` (or by hand). Ordinary builds do not change the
+#  version. Reads src\version.h, increments RAMSTAIN_VER_MINOR, resets
+#  RAMSTAIN_VER_PATCH to 0, and rewrites the file.
 # =============================================================================
 param(
     [string]$Header = (Join-Path $PSScriptRoot "..\src\version.h")
@@ -25,10 +25,10 @@ $lines = @(
     "// RAMstain version - single source of truth for the EXE version resource",
     "// (ramstain.rc), the UI footer and the .meta sidecar (RAMstain.cpp).",
     "//",
-    "// GENERATED: scripts\bump-version.ps1 rewrites this file before every build",
-    "// (MSBuild PreBuildEvent), incrementing the minor number. To change the major",
-    "// version or reset the minor, edit the numbers below; the next build continues",
-    "// from them.",
+    "// GENERATED: scripts\bump-version.ps1 rewrites this file for a release",
+    "// (build.bat bump), incrementing the minor number. Ordinary builds leave it",
+    "// alone. To change the major version or reset the minor, edit the numbers",
+    "// below; the next bump continues from them.",
     "#ifndef RAMSTAIN_VERSION_H",
     "#define RAMSTAIN_VERSION_H",
     "",

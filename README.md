@@ -42,8 +42,14 @@ WinPmem.
 - **Pagefile / hibernation file / swapfile collection:** optionally collect
   `pagefile.sys`, `hiberfil.sys` and `swapfile.sys` alongside the memory image,
   or on their own, each with its own SHA-256 and `.meta` sidecar.
-- **Safety checks:** overwrite prompt, free-space check, and a warning if you
-  close the window during a capture.
+- **Case details:** optional case number, examiner and notes, written into
+  every `.meta` sidecar and the run log.
+- **Unattended mode** (`--auto`) for remote incident response: starts at once,
+  no dialogs, prints the result and hashes, and returns an exit code.
+- **Verify** a capture later (`--verify <folder>`): re-hashes every file
+  against its `.meta`, e.g. after copying evidence to another drive.
+- **Safety checks:** each run in its own new folder (nothing is overwritten),
+  free-space check, and a warning if you close the window during a capture.
 
 ## Usage
 
@@ -62,8 +68,11 @@ D:\evidence\RAMstain_20260928_163614\host1.raw
 So runs never mix or overwrite each other, and missing folders are created.
 The default file name is the computer name (e.g. `WS-01.raw`).
 
-When it finishes you get a summary with size, time, speed and SHA-256. **Copy hashes** puts the SHA-256 of every file from the run
-on the clipboard in `sha256sum` format (`<hash>  <file name>`), ready to paste
+**Case details (optional)** - case number, examiner and notes - are written at
+the top of every `.meta` sidecar and in the run log.
+
+When it finishes you get a summary with size, time, speed and SHA-256.
+**Copy hashes** puts the SHA-256 of every file from the run on the clipboard in `sha256sum` format (`<hash>  <file name>`), ready to paste
 into case notes or to check later with `sha256sum -c` in the output folder.
 
 ### Keyboard
@@ -77,6 +86,7 @@ with **Alt**:
 | Alt+C | Capture |
 | Alt+O / Alt+S | Close / Stop (during a capture) |
 | Alt+T | Save-to path field |
+| Alt+E | Case details (case number field) |
 | Alt+B | Browse… |
 | Alt+L | Split drop-down |
 | Alt+D | Use WinPmem driver |
@@ -103,12 +113,43 @@ RAMstain.exe --hiberfil                   also collect hiberfil.sys
 RAMstain.exe --swapfile                   also collect swapfile.sys
 RAMstain.exe --system-files               also collect pagefile, hibernation file and swapfile
 RAMstain.exe --no-memory --system-files   system files only, no memory image
+RAMstain.exe --case "2026-042" --examiner "J. Doe" --notes "..."   case details
+RAMstain.exe --auto ...                   unattended: start at once, no dialogs, exit with a code
+RAMstain.exe --verify "D:\evidence"       re-hash captures against their .meta records
 RAMstain.exe --selftest "C:\out\test.raw" 512 MB synthetic test, no real memory read
 RAMstain.exe --help                       list the options (also -h, /?)
 ```
 
 Options only preselect the window's settings; the capture starts when you
-click **Capture**. An unknown option shows the help instead of starting.
+click **Capture** (or at once with `--auto`). An unknown option shows the help
+instead of starting.
+
+**Unattended capture** - for remote shells (PsExec, EDR live response):
+
+```
+RAMstain.exe --auto "D:\evidence\host1.raw" --system-files --case "2026-042" > result.txt
+```
+
+It shows the window with progress but no dialogs: a question that would
+normally be asked (e.g. not enough disk space) stops the run instead. The
+result, including the SHA-256 of every file, goes to the console or the
+redirected output.
+
+**Verify** - `RAMstain.exe --verify <folder>` takes a run folder, a folder of
+run folders, or one `.meta` file. Each file is found by name next to its
+`.meta`, so a copied capture still verifies; split images are checked as a
+whole and part by part in one pass.
+
+| Exit code | `--auto` | `--verify` |
+|-----------|----------|------------|
+| 0 | everything requested was collected and hashed | all files match |
+| 1 | something failed, was stopped, or is incomplete | a file is missing or differs |
+| 2 | bad option | bad option, or nothing to verify |
+| 3 | could not start (a check failed) | |
+| 4 | RAMstain is already running | |
+
+A system file that does not exist on the machine (e.g. hibernation disabled)
+is not a failure.
 
 `--help` prints to the console when it can: redirected output
 (`RAMstain.exe --help > help.txt`, or piped) or an elevated prompt. From a
@@ -230,13 +271,21 @@ build.bat Debug      :: Debug    ->  x64\Debug\RAMstain.exe
 
 Or open `RAMstain.sln` and build **Release | x64**.
 
-Each build bumps the minor version in `src\version.h` (via
-`scripts\bump-version.ps1`). Edit that file to change the major version.
+Builds do not change the version. For a release, `build.bat bump` first
+increments the minor version in `src\version.h` (via
+`scripts\bump-version.ps1`); edit that file to change the major version.
 
 ### Repository layout
 
 ```
-src/                  application source (RAMstain.cpp, resources, legal text)
+src/                  application source:
+  RAMstain.cpp          window, capture flow, WinPmem driver, system-file collection
+  ntfs_raw.*            raw NTFS reader for locked files (pagefile, hibernation, swapfile)
+  hash_pipeline.h       SHA-256 on background threads (whole image + split parts)
+  verify.*              --verify
+  run_log.h             the <name>.log run log
+  sha256.h, util.h      SHA-256 via Windows CNG; string helpers
+  legal.h, resources    in-app legal text, icon, version resource
 scripts/              build helpers (version bump)
 third_party/winpmem/  embedded WinPmem imager, its license, and provenance notes
 build.bat             build wrapper

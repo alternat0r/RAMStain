@@ -54,6 +54,11 @@
 #include <cstdio>
 #include <cstdint>
 #include "sha256.h"
+#include "util.h"
+#include "hash_pipeline.h"
+#include "run_log.h"
+#include "ntfs_raw.h"
+#include "verify.h"
 #include "legal.h"
 #include "resource.h"
 #include "version.h"
@@ -152,23 +157,29 @@ static HFONT  g_fFoot = nullptr;  // header subtitle / footer text
 
 // Main window layout, in 96-dpi pixels (scaled with Sc()). Client area is
 // kDesignW x kDesignH; see DrawMain and WM_CREATE for the rows.
-static const int kDesignW = 520, kDesignH = 376;
+static const int kDesignW = 520, kDesignH = 426;
 static const int kPad     = 16;   // outer margin
 static const int kHeaderH = 48;   // dark header band
 static const int kCol2    = 268;  // x of the second column (Host/OS, driver checkbox)
 static const int kBrowseW = 80;   // Browse button width
-static const int kFooterY = 348;  // top of the footer strip
+static const int kFooterY = 398;  // top of the footer strip
+// Case details row: Case number, Examiner, Notes (x, width).
+static const struct { int x, w; } kCaseFields[] = { { 16, 140 }, { 164, 150 }, { 322, 182 } };
 static HICON  g_hIcon = nullptr;
 static HICON  g_hIconAbout = nullptr;   // larger icon for the About dialog (loaded on first use)
 
 static HWND   g_hwnd = nullptr;
-static HWND   g_editPath, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
+static HWND   g_editPath, g_editCase, g_editExaminer, g_editNotes, g_lblCase, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
               g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit,
               g_btnSplitHelp, g_lblSave, g_lblSplit, g_lblCollect,
               g_chkMemory, g_chkPagefile, g_chkHiberfil, g_chkSwapfile;
 static HWND   g_lastFocus = nullptr;    // control to refocus when the window is reactivated
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
+// --auto: capture at once with no dialogs, print the result, exit with a code
+// (see AutoExitCode). g_exitCode is the process exit code (WM_DESTROY).
+static bool   g_auto = false;
+static int    g_exitCode = 0;
 static bool   g_finishPending = false; // capture finished while a dialog was open
 static bool   g_closeAfterStop = false;// user chose "Stop and close": exit when the capture ends
 static bool   g_selftest  = false;
@@ -192,6 +203,10 @@ static bool   g_cliCollectSwapfile = false;
 // --no-memory preselect for its checkbox.
 static bool   g_captureMemory = true;
 static bool   g_cliNoMemory = false;
+// Case details for this run (resolved from the fields in OnCapture; one line
+// each, may be empty) and their --case / --examiner / --notes preselects.
+static std::wstring g_caseNumber, g_caseExaminer, g_caseNotes;
+static std::wstring g_cliCase, g_cliExaminer, g_cliNotes;
 
 static std::wstring g_status;        // status line text
 static COLORREF     g_statusColor;   // status line color
@@ -234,6 +249,7 @@ struct SysFileCapture {
     FILETIME     endUtc = {};        // collection end (UTC)
     std::wstring metaPath;           // <path>.meta sidecar (empty if not written)
     std::wstring error;              // user-facing note when collection failed (empty on success)
+    bool         absent = false;     // the file does not exist on this system (nothing to collect)
 };
 
 struct CaptureResult {
@@ -257,157 +273,6 @@ struct CaptureResult {
     std::vector<SysFileCapture> sysfiles;  // pagefile / hibernation files collected alongside
 };
 
-// SHA-256 of a byte stream, fed in one pass.
-struct ImageHash {
-    SHA256 sha256;
-    void Update(const BYTE* p, size_t n) { sha256.Update(p, n); }
-};
-
-// Hashes of consecutive fixed-size slices of a byte stream, computed alongside
-// the whole-image hashes so a split image gets per-part hashes without a
-// second pass over the data. partSize 0 = disabled.
-struct PartHasher {
-    UINT64 partSize = 0, inPart = 0;
-    ImageHash cur;
-    std::vector<std::string> sha256s;
-    explicit PartHasher(UINT64 ps) : partSize(ps) {}
-    void Update(const BYTE* p, size_t n) {
-        if (!partSize) return;
-        while (n > 0) {
-            size_t take = (size_t)min((UINT64)n, partSize - inPart);
-            cur.Update(p, take);
-            inPart += take; p += take; n -= take;
-            if (inPart == partSize) Close();
-        }
-    }
-    // Call once at the end; moves the per-part hashes into out.
-    void Finish(std::vector<std::string>& out) {
-        if (partSize && inPart > 0) Close();
-        out = std::move(sha256s);
-    }
-private:
-    void Close() {
-        sha256s.push_back(cur.sha256.Hex());
-        cur.sha256.Reset();
-        inPart = 0;
-    }
-};
-
-// Hashes a byte stream on background threads, so the caller can read (and
-// write) the next block while earlier blocks are still being hashed: the time
-// is max(I/O, hashing) instead of their sum. The whole-image hash and the
-// per-part hashes (partSize != 0) each get their own thread, so splitting
-// does not double the hashing time.
-//
-// Usage: fill the buffer from Acquire(), hand it over with Submit(n), repeat;
-// then Finish() for the digests. kSlots buffers rotate, so reading runs up to
-// kSlots - 1 blocks ahead of hashing. Destroying the pipeline without calling
-// Finish() abandons the hash (Stop pressed / error). If a thread cannot be
-// started, that hash is computed inline in Submit() instead.
-class HashPipeline {
-public:
-    HashPipeline(size_t blockBytes, UINT64 partSize) : m_parts(partSize) {
-        // Page-aligned (VirtualAlloc), as raw volume reads require.
-        for (Slot& s : m_slot)
-            s.buf = (BYTE*)VirtualAlloc(nullptr, blockBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        m_thread[0] = CreateThread(nullptr, 0, WholeThread, this, 0, nullptr);
-        if (partSize)
-            m_thread[1] = CreateThread(nullptr, 0, PartThread, this, 0, nullptr);
-        m_consumers = (m_thread[0] ? 1 : 0) + (m_thread[1] ? 1 : 0);
-    }
-    ~HashPipeline() {
-        Join(true);
-        for (Slot& s : m_slot) if (s.buf) VirtualFree(s.buf, 0, MEM_RELEASE);
-    }
-    HashPipeline(const HashPipeline&) = delete;
-    HashPipeline& operator=(const HashPipeline&) = delete;
-
-    // Next buffer to fill (blockBytes long); waits while all are being hashed.
-    BYTE* Acquire() {
-        Slot& s = m_slot[m_submitted % kSlots];
-        AcquireSRWLockExclusive(&m_lock);
-        while (s.pending > 0)
-            SleepConditionVariableSRW(&m_cv, &m_lock, INFINITE, 0);
-        ReleaseSRWLockExclusive(&m_lock);
-        return s.buf;
-    }
-
-    // Hand the first n bytes of the buffer from Acquire() to the hashers.
-    void Submit(size_t n) {
-        Slot& s = m_slot[m_submitted % kSlots];
-        s.n = n;
-        if (!m_thread[0]) m_whole.Update(s.buf, n);
-        if (m_parts.partSize && !m_thread[1]) m_parts.Update(s.buf, n);
-        AcquireSRWLockExclusive(&m_lock);
-        s.pending = m_consumers;
-        ++m_submitted;
-        ReleaseSRWLockExclusive(&m_lock);
-        WakeAllConditionVariable(&m_cv);
-    }
-
-    // Wait until everything submitted is hashed. Returns the whole-stream
-    // SHA-256; per-part hashes go to partHashes when given.
-    std::string Finish(std::vector<std::string>* partHashes = nullptr) {
-        Join(false);
-        if (partHashes) m_parts.Finish(*partHashes);
-        return m_whole.sha256.Hex();
-    }
-
-private:
-    static const int kSlots = 4;
-    struct Slot {
-        BYTE* buf = nullptr;
-        size_t n = 0;
-        int pending = 0;          // hasher threads still reading this buffer
-    };
-
-    static DWORD WINAPI WholeThread(LPVOID p) { ((HashPipeline*)p)->Consume(false); return 0; }
-    static DWORD WINAPI PartThread(LPVOID p)  { ((HashPipeline*)p)->Consume(true);  return 0; }
-
-    void Consume(bool parts) {
-        for (UINT64 next = 0;; ++next) {
-            AcquireSRWLockExclusive(&m_lock);
-            while (next == m_submitted && !m_closing)
-                SleepConditionVariableSRW(&m_cv, &m_lock, INFINITE, 0);
-            bool have = next < m_submitted && !m_abort;
-            ReleaseSRWLockExclusive(&m_lock);
-            if (!have) return;
-            Slot& s = m_slot[next % kSlots];
-            if (parts) m_parts.Update(s.buf, s.n);
-            else       m_whole.Update(s.buf, s.n);
-            AcquireSRWLockExclusive(&m_lock);
-            --s.pending;
-            ReleaseSRWLockExclusive(&m_lock);
-            WakeAllConditionVariable(&m_cv);
-        }
-    }
-
-    // abort: stop without hashing the rest. Safe to call more than once.
-    void Join(bool abort) {
-        AcquireSRWLockExclusive(&m_lock);
-        m_closing = true;
-        if (abort) m_abort = true;
-        ReleaseSRWLockExclusive(&m_lock);
-        WakeAllConditionVariable(&m_cv);
-        for (HANDLE& t : m_thread) {
-            if (!t) continue;
-            WaitForSingleObject(t, INFINITE);
-            CloseHandle(t);
-            t = nullptr;
-        }
-    }
-
-    Slot       m_slot[kSlots];
-    ImageHash  m_whole;
-    PartHasher m_parts;
-    HANDLE     m_thread[2] = {};
-    int        m_consumers = 0;
-    UINT64     m_submitted = 0;   // blocks handed to the hashers so far
-    bool       m_closing = false; // no more blocks coming
-    bool       m_abort = false;   // ... and drop the ones not yet hashed
-    SRWLOCK            m_lock = SRWLOCK_INIT;
-    CONDITION_VARIABLE m_cv = CONDITION_VARIABLE_INIT;
-};
 static CaptureResult* g_activeResult = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -430,21 +295,7 @@ static void TrimRight(std::wstring& s) {
         s.pop_back();
 }
 
-static std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w;
-    if (n > 0) { w.resize(n); MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n); }
-    return w;
-}
 
-static std::string WideToUtf8(const std::wstring& w) {
-    if (w.empty()) return std::string();
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s;
-    if (n > 0) { s.resize(n); WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr); }
-    return s;
-}
 
 static std::wstring GetExeDir() {
     wchar_t buf[MAX_PATH] = L"";
@@ -550,17 +401,28 @@ static std::wstring FormatGB(UINT64 bytes) {
 }
 
 // Free space on the volume containing `path`.
+// Free space for a file that will be written at path. The folders on the way
+// may not exist yet (each capture creates its own run folder, plus any missing
+// parents), so measure the nearest folder that does exist - it is on the same
+// volume unless a missing folder would be a mount point, which it cannot be.
 static bool GetVolumeFreeBytes(const std::wstring& path, UINT64& freeBytes) {
-    std::wstring root = path;
-    size_t sl = root.find_last_of(L"\\/");
-    if (sl != std::wstring::npos && (sl + 1) != root.size()) root = root.substr(0, sl + 1);
-    if (root.size() == 2 && root[1] == L':') root.push_back(L'\\');
-    ULARGE_INTEGER avail = {0}, total = {0}, totalFree = {0};
-    if (GetDiskFreeSpaceExW(root.c_str(), &avail, &total, &totalFree)) {
-        freeBytes = avail.QuadPart;
-        return true;
+    std::wstring dir = path;
+    for (;;) {
+        size_t sl = dir.find_last_of(L"\\/");
+        if (sl == std::wstring::npos) return false;
+        dir.erase(sl);                                     // parent folder
+        if (dir.empty() || dir == L"\\") return false;     // ran out (e.g. "\\server")
+        std::wstring probe = (dir.size() == 2 && dir[1] == L':') ? dir + L"\\" : dir;
+        DWORD a = GetFileAttributesW(probe.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+            ULARGE_INTEGER avail = {0}, total = {0}, totalFree = {0};
+            if (probe.back() != L'\\') probe += L"\\";
+            if (!GetDiskFreeSpaceExW(probe.c_str(), &avail, &total, &totalFree))
+                return false;
+            freeBytes = avail.QuadPart;
+            return true;
+        }
     }
-    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -616,63 +478,6 @@ static std::wstring FormatUtcAndLocal(FILETIME ft) {
     return buf;
 }
 
-// ---------------------------------------------------------------------------
-//  Run log (<image base>.log)
-//
-//  Each run appends a timestamped record - options, method, every phase,
-//  errors, and the results with their hashes - to a text log next to the
-//  image. Entries are written and flushed as they happen, so the log survives
-//  an interrupted run, and appending keeps the history of earlier runs to the
-//  same name. The worker and UI threads both log, so writes are serialized.
-// ---------------------------------------------------------------------------
-class RunLog {
-public:
-    // Open for appending (created if missing). On failure the run goes ahead
-    // without a log and Path() is empty.
-    bool Open(const std::wstring& path) {
-        Close();
-        m_h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
-                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        m_path = (m_h != INVALID_HANDLE_VALUE) ? path : std::wstring();
-        return !m_path.empty();
-    }
-    void Close() {
-        AcquireSRWLockExclusive(&m_lock);
-        if (m_h != INVALID_HANDLE_VALUE) CloseHandle(m_h);
-        m_h = INVALID_HANDLE_VALUE;
-        ReleaseSRWLockExclusive(&m_lock);
-    }
-    const std::wstring& Path() const { return m_path; }   // kept after Close()
-
-    // One entry, "2026-09-30T13:14:24.123Z  text"; further lines of a
-    // multi-line text are indented under it.
-    void Line(const std::wstring& text) {
-        SYSTEMTIME u;
-        GetSystemTime(&u);
-        wchar_t ts[32];
-        _snwprintf_s(ts, _countof(ts), _TRUNCATE, L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ  ",
-                     u.wYear, u.wMonth, u.wDay, u.wHour, u.wMinute, u.wSecond, u.wMilliseconds);
-        std::wstring line = ts;
-        for (wchar_t c : text) {
-            if (c == L'\n') line += L"\r\n" + std::wstring(26, L' ');
-            else if (c != L'\r') line += c;
-        }
-        line += L"\r\n";
-        std::string u8 = WideToUtf8(line);
-        AcquireSRWLockExclusive(&m_lock);
-        if (m_h != INVALID_HANDLE_VALUE) {
-            DWORD wr = 0;
-            WriteFile(m_h, u8.data(), (DWORD)u8.size(), &wr, nullptr);
-            FlushFileBuffers(m_h);
-        }
-        ReleaseSRWLockExclusive(&m_lock);
-    }
-
-private:
-    HANDLE       m_h = INVALID_HANDLE_VALUE;
-    std::wstring m_path;
-    SRWLOCK      m_lock = SRWLOCK_INIT;
-};
 static RunLog g_log;
 
 // Tell the UI which phase the worker is in (wParam = CapturePhase) and how
@@ -683,6 +488,16 @@ static void PostPhase(CapturePhase phase, UINT64 totalBytes) {
     g_log.Line(std::wstring(L"Phase: ") + kNames[(int)phase] +
                (totalBytes ? L" (" + std::to_wstring(totalBytes) + L" bytes expected)" : L""));
     PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)phase, (LPARAM)totalBytes);
+}
+
+// "Case:" / "Examiner:" / "Notes:" lines for the .meta sidecars and the run
+// log - only the details that were filled in (empty string when none were).
+static std::wstring CaseDetailsLines() {
+    std::wstring s;
+    if (!g_caseNumber.empty())   s += L"Case:        " + g_caseNumber + L"\n";
+    if (!g_caseExaminer.empty()) s += L"Examiner:    " + g_caseExaminer + L"\n";
+    if (!g_caseNotes.empty())    s += L"Notes:       " + g_caseNotes + L"\n";
+    return s;
 }
 
 // A whole-image hash (res->sha256) as shown in the .meta sidecar
@@ -739,7 +554,8 @@ static void WriteMetaSidecar(CaptureResult* res, bool selftest) {
 
     std::wstring meta =
         L"RAMstain capture metadata\n"
-        L"=========================\n"
+        L"=========================\n" +
+        CaseDetailsLines() +
         L"Image:       " + imageLine + L"\n" +
         L"Host:        " + hostName + L"\n" +
         L"OS:          " + osVersion + L"\n" +
@@ -1394,312 +1210,6 @@ static bool FilePresent(const std::wstring& p) {
     return !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-// ---------------------------------------------------------------------------
-//  Raw NTFS reading of a locked file
-//
-//  The kernel opens pagefile.sys and hiberfil.sys with no sharing at all, so
-//  CreateFile fails with ERROR_SHARING_VIOLATION even for an Administrator,
-//  even for attribute-only access. Instead: list the parent directory (which
-//  gives the file's MFT record number without opening the file), fetch that
-//  record from the volume with FSCTL_GET_NTFS_FILE_RECORD, decode the cluster
-//  runs of its unnamed $DATA attribute, and read those clusters directly from
-//  the volume. NTFS only. The file is live, so the copy reflects its contents
-//  at the moment each block is read (as with any live acquisition).
-// ---------------------------------------------------------------------------
-
-// One run of clusters: file clusters [vcn, vcn + clusters) are at volume
-// cluster lcn (or not allocated at all when sparse - they read as zeros).
-struct RawExtent { UINT64 vcn, lcn, clusters; bool sparse; };
-
-struct RawFileMap {
-    HANDLE volume = INVALID_HANDLE_VALUE;   // opened for raw reads
-    UINT64 cluster = 0;                     // bytes per cluster
-    UINT64 size = 0;                        // file size
-    UINT64 validSize = 0;                   // initialized size; bytes past it read as zero
-    std::vector<RawExtent> extents;         // sorted by vcn, covering the file
-    RawFileMap() = default;
-    RawFileMap(const RawFileMap&) = delete;
-    RawFileMap& operator=(const RawFileMap&) = delete;
-    ~RawFileMap() { if (volume != INVALID_HANDLE_VALUE) CloseHandle(volume); }
-};
-
-static UINT16 Rd16(const BYTE* p) { return (UINT16)(p[0] | (p[1] << 8)); }
-static UINT32 Rd32(const BYTE* p) { return (UINT32)Rd16(p) | ((UINT32)Rd16(p + 2) << 16); }
-static UINT64 Rd64(const BYTE* p) { return (UINT64)Rd32(p) | ((UINT64)Rd32(p + 4) << 32); }
-static const UINT64 kMftRefMask = 0x0000FFFFFFFFFFFFull;   // record number (low 48 bits)
-
-// MFT record number of path, read from its parent directory's listing.
-static bool FindFileRecordNumber(const std::wstring& path, UINT64& frn) {
-    size_t sl = path.find_last_of(L"\\/");
-    if (sl == std::wstring::npos) return false;
-    std::wstring dir = path.substr(0, sl + 1), name = path.substr(sl + 1);
-    HANDLE hd = CreateFileW(dir.c_str(), FILE_LIST_DIRECTORY,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (hd == INVALID_HANDLE_VALUE) return false;
-    std::vector<ULONGLONG> buf(64 * 1024 / sizeof(ULONGLONG));   // 8-byte aligned
-    FILE_INFO_BY_HANDLE_CLASS cls = FileIdBothDirectoryRestartInfo;
-    bool found = false;
-    while (!found && GetFileInformationByHandleEx(hd, cls, buf.data(),
-                                                  (DWORD)(buf.size() * sizeof(ULONGLONG)))) {
-        cls = FileIdBothDirectoryInfo;
-        auto* e = (FILE_ID_BOTH_DIR_INFO*)buf.data();
-        for (;;) {
-            std::wstring n(e->FileName, e->FileNameLength / sizeof(wchar_t));
-            if (_wcsicmp(n.c_str(), name.c_str()) == 0) {
-                frn = (UINT64)e->FileId.QuadPart;
-                found = true;
-                break;
-            }
-            if (!e->NextEntryOffset) break;
-            e = (FILE_ID_BOTH_DIR_INFO*)((BYTE*)e + e->NextEntryOffset);
-        }
-    }
-    CloseHandle(hd);
-    return found;
-}
-
-// One MFT record (FILE record segment) by number, with the update-sequence
-// fixups applied if the driver has not already applied them.
-static bool ReadMftRecord(HANDLE vol, UINT64 frn, DWORD recSize, std::vector<BYTE>& rec) {
-    NTFS_FILE_RECORD_INPUT_BUFFER in;
-    in.FileReferenceNumber.QuadPart = (LONGLONG)(frn & kMftRefMask);
-    std::vector<BYTE> out(sizeof(NTFS_FILE_RECORD_OUTPUT_BUFFER) + recSize);
-    DWORD br = 0;
-    if (!DeviceIoControl(vol, FSCTL_GET_NTFS_FILE_RECORD, &in, sizeof(in),
-                         out.data(), (DWORD)out.size(), &br, nullptr))
-        return false;
-    auto* o = (NTFS_FILE_RECORD_OUTPUT_BUFFER*)out.data();
-    // The FSCTL returns the nearest in-use record at or below the one asked for.
-    if (((UINT64)o->FileReferenceNumber.QuadPart & kMftRefMask) != (frn & kMftRefMask))
-        return false;
-    if (o->FileRecordLength < 64 || o->FileRecordLength > recSize) return false;
-    rec.assign(o->FileRecordBuffer, o->FileRecordBuffer + o->FileRecordLength);
-    if (memcmp(rec.data(), "FILE", 4) != 0) return false;
-    UINT16 usaOff = Rd16(&rec[4]), usaCount = Rd16(&rec[6]);
-    if (usaCount >= 2 && (size_t)usaOff + usaCount * 2u <= rec.size()) {
-        size_t stride = rec.size() / (usaCount - 1);
-        UINT16 usn = Rd16(&rec[usaOff]);
-        bool present = true;
-        for (UINT16 i = 1; i < usaCount && present; ++i)
-            present = i * stride <= rec.size() && Rd16(&rec[i * stride - 2]) == usn;
-        if (present)
-            for (UINT16 i = 1; i < usaCount; ++i)
-                memcpy(&rec[i * stride - 2], &rec[usaOff + 2 * i], 2);
-    }
-    return true;
-}
-
-// Decode an NTFS mapping-pairs array (the run list) starting at file cluster vcn.
-static bool DecodeRuns(const BYTE* p, const BYTE* end, UINT64 vcn, std::vector<RawExtent>& out) {
-    INT64 lcn = 0;
-    while (p < end && *p) {
-        int lenSz = *p & 0x0F, offSz = *p >> 4;
-        ++p;
-        if (lenSz == 0 || lenSz > 8 || offSz > 8 || p + lenSz + offSz > end) return false;
-        UINT64 len = 0;
-        for (int i = 0; i < lenSz; ++i) len |= (UINT64)p[i] << (8 * i);
-        p += lenSz;
-        if (offSz == 0) {
-            out.push_back({ vcn, 0, len, true });            // sparse run
-        } else {
-            UINT64 d = 0;
-            for (int i = 0; i < offSz; ++i) d |= (UINT64)p[i] << (8 * i);
-            if (offSz < 8 && (p[offSz - 1] & 0x80)) d |= ~0ull << (8 * offSz);   // sign-extend
-            lcn += (INT64)d;
-            if (lcn < 0) return false;
-            out.push_back({ vcn, (UINT64)lcn, len, false });
-        }
-        p += offSz;
-        vcn += len;
-    }
-    return true;
-}
-
-// Read whole clusters of a run list from the volume (for a non-resident
-// attribute list; small).
-static bool ReadRunsRaw(HANDLE vol, UINT64 cluster, const std::vector<RawExtent>& runs,
-                        UINT64 bytes, std::vector<BYTE>& out) {
-    out.clear();
-    for (const RawExtent& e : runs) {
-        size_t at = out.size();
-        out.resize(at + (size_t)(e.clusters * cluster));
-        if (e.sparse) continue;
-        LARGE_INTEGER li;
-        li.QuadPart = (LONGLONG)(e.lcn * cluster);
-        DWORD rd = 0;
-        if (!SetFilePointerEx(vol, li, nullptr, FILE_BEGIN) ||
-            !ReadFile(vol, &out[at], (DWORD)(e.clusters * cluster), &rd, nullptr) ||
-            rd != e.clusters * cluster)
-            return false;
-    }
-    if (out.size() < bytes) return false;
-    out.resize((size_t)bytes);
-    return true;
-}
-
-// Walk one record's attributes: add the unnamed $DATA runs to map (sizes from
-// the segment that starts at VCN 0) and, when attrList is given, return the
-// $ATTRIBUTE_LIST contents.
-static bool ParseDataAttribute(const std::vector<BYTE>& rec, RawFileMap& map, bool& haveSizes,
-                               std::vector<BYTE>* attrList, std::wstring& err) {
-    size_t a = Rd16(&rec[0x14]);                          // first attribute
-    while (a + 16 <= rec.size()) {
-        UINT32 type = Rd32(&rec[a]);
-        if (type == 0xFFFFFFFF) break;
-        UINT32 len = Rd32(&rec[a + 4]);
-        if (len < 16 || a + len > rec.size()) { err = L"malformed MFT record"; return false; }
-        const BYTE* at = &rec[a];
-        bool nonResident = at[8] != 0;
-        BYTE nameLen = at[9];
-        UINT16 flags = Rd16(at + 0x0C);
-        if (type == 0x80 && nameLen == 0) {
-            if (!nonResident || len < 0x40) { err = L"unexpected resident $DATA"; return false; }
-            if (flags & 0x4001) { err = L"file is compressed or encrypted"; return false; }
-            UINT64 startVcn = Rd64(at + 0x10);
-            if (startVcn == 0) {
-                map.size = Rd64(at + 0x30);
-                map.validSize = Rd64(at + 0x38);
-                haveSizes = true;
-            }
-            if (!DecodeRuns(at + Rd16(at + 0x20), at + len, startVcn, map.extents)) {
-                err = L"malformed run list";
-                return false;
-            }
-        } else if (type == 0x20 && attrList) {            // $ATTRIBUTE_LIST
-            if (!nonResident) {
-                UINT32 vlen = Rd32(at + 0x10);
-                UINT16 voff = Rd16(at + 0x14);
-                if ((size_t)voff + vlen > len) { err = L"malformed attribute list"; return false; }
-                attrList->assign(at + voff, at + voff + vlen);
-            } else {
-                std::vector<RawExtent> runs;
-                if (len < 0x40 || !DecodeRuns(at + Rd16(at + 0x20), at + len, 0, runs) ||
-                    !ReadRunsRaw(map.volume, map.cluster, runs, Rd64(at + 0x30), *attrList)) {
-                    err = L"could not read the attribute list";
-                    return false;
-                }
-            }
-        }
-        a += len;
-    }
-    return true;
-}
-
-// Build the cluster map of a locked file on an NTFS volume (see above).
-static bool MapLockedFile(const std::wstring& path, RawFileMap& map, std::wstring& err) {
-    wchar_t mount[MAX_PATH] = L"", vol[MAX_PATH] = L"", fs[64] = L"";
-    if (!GetVolumePathNameW(path.c_str(), mount, MAX_PATH) ||
-        !GetVolumeInformationW(mount, nullptr, 0, nullptr, nullptr, nullptr, fs, 64) ||
-        !GetVolumeNameForVolumeMountPointW(mount, vol, MAX_PATH)) {
-        err = L"could not identify the volume of " + path + L" (error " + std::to_wstring(GetLastError()) + L")";
-        return false;
-    }
-    if (_wcsicmp(fs, L"NTFS") != 0) {
-        err = path + L" is on a " + fs + L" volume; reading a locked file is supported on NTFS only";
-        return false;
-    }
-    std::wstring volPath = vol;
-    if (!volPath.empty() && volPath.back() == L'\\') volPath.pop_back();   // \\?\Volume{...}
-    map.volume = CreateFileW(volPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                             nullptr, OPEN_EXISTING, 0, nullptr);
-    if (map.volume == INVALID_HANDLE_VALUE) {
-        err = L"could not open the volume for raw reading (error " + std::to_wstring(GetLastError()) + L")";
-        return false;
-    }
-    NTFS_VOLUME_DATA_BUFFER vd = {};
-    DWORD br = 0;
-    if (!DeviceIoControl(map.volume, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0, &vd, sizeof(vd), &br, nullptr)) {
-        err = L"could not read NTFS volume data (error " + std::to_wstring(GetLastError()) + L")";
-        return false;
-    }
-    map.cluster = vd.BytesPerCluster;
-    DWORD recSize = vd.BytesPerFileRecordSegment;
-
-    UINT64 frn = 0;
-    std::vector<BYTE> rec, attrList;
-    bool haveSizes = false;
-    if (!FindFileRecordNumber(path, frn) || !ReadMftRecord(map.volume, frn, recSize, rec)) {
-        err = L"could not locate the MFT record of " + path;
-        return false;
-    }
-    if (!ParseDataAttribute(rec, map, haveSizes, &attrList, err)) return false;
-
-    // A heavily fragmented file continues its $DATA runs in other records,
-    // listed in $ATTRIBUTE_LIST: type u32 @0, length u16 @4, name length @6,
-    // record reference u64 @0x10.
-    std::vector<UINT64> seen{ frn & kMftRefMask };
-    for (size_t o = 0; o + 0x1A <= attrList.size();) {
-        UINT16 elen = Rd16(&attrList[o + 4]);
-        if (elen < 0x1A || o + elen > attrList.size()) break;
-        UINT64 ref = Rd64(&attrList[o + 0x10]) & kMftRefMask;
-        if (Rd32(&attrList[o]) == 0x80 && attrList[o + 6] == 0 &&
-            std::find(seen.begin(), seen.end(), ref) == seen.end()) {
-            seen.push_back(ref);
-            std::vector<BYTE> ext;
-            if (!ReadMftRecord(map.volume, ref, recSize, ext) ||
-                !ParseDataAttribute(ext, map, haveSizes, nullptr, err)) {
-                if (err.empty()) err = L"could not read an extension MFT record";
-                return false;
-            }
-        }
-        o += elen;
-    }
-
-    // The runs must cover the file from cluster 0 without gaps.
-    std::sort(map.extents.begin(), map.extents.end(),
-              [](const RawExtent& x, const RawExtent& y) { return x.vcn < y.vcn; });
-    UINT64 next = 0;
-    for (const RawExtent& e : map.extents) {
-        if (e.vcn != next) { err = L"incomplete cluster map"; return false; }
-        next += e.clusters;
-    }
-    if (!haveSizes || next * map.cluster < map.size) { err = L"incomplete cluster map"; return false; }
-    if (map.validSize > map.size) map.validSize = map.size;
-    return true;
-}
-
-// Sequential reader over a RawFileMap. cap (the buffer size) must be a
-// multiple of the cluster size and buf sector-aligned.
-class RawFileReader {
-public:
-    explicit RawFileReader(const RawFileMap& m) : m_map(m) {}
-    // Next bytes of the file (got = 0 at the end). False on a read error.
-    bool Read(BYTE* buf, DWORD cap, DWORD& got) {
-        got = 0;
-        if (m_off >= m_map.size) return true;
-        const UINT64 cl = m_map.cluster;
-        while (m_i < m_map.extents.size() &&
-               (m_map.extents[m_i].vcn + m_map.extents[m_i].clusters) * cl <= m_off)
-            ++m_i;
-        if (m_i >= m_map.extents.size()) return false;
-        const RawExtent& e = m_map.extents[m_i];
-        UINT64 inExt = m_off - e.vcn * cl;                               // cluster-aligned
-        UINT64 len = min((UINT64)cap, e.clusters * cl - inExt);          // whole clusters
-        if (e.sparse) {
-            memset(buf, 0, (size_t)len);
-        } else {
-            LARGE_INTEGER li;
-            li.QuadPart = (LONGLONG)(e.lcn * cl + inExt);
-            DWORD rd = 0;
-            if (!SetFilePointerEx(m_map.volume, li, nullptr, FILE_BEGIN) ||
-                !ReadFile(m_map.volume, buf, (DWORD)len, &rd, nullptr) || rd != len)
-                return false;
-        }
-        UINT64 n = min(len, m_map.size - m_off);
-        if (m_off + n > m_map.validSize) {                               // past valid data
-            UINT64 z = m_map.validSize > m_off ? m_map.validSize - m_off : 0;
-            memset(buf + z, 0, (size_t)(n - z));
-        }
-        m_off += n;
-        got = (DWORD)n;
-        return true;
-    }
-private:
-    const RawFileMap& m_map;
-    size_t m_i = 0;
-    UINT64 m_off = 0;
-};
 
 // The .meta sidecar for one requested system file (written on every outcome -
 // success, partial, or "not found" - so the record exists either way).
@@ -1715,6 +1225,7 @@ static void WriteSysFileMeta(const SysFileCapture& sf, const std::wstring& metaP
     std::wstring m;
     m += L"RAMstain system file metadata\n";
     m += L"=============================\n";
+    m += CaseDetailsLines();
     m += L"File:        ";  m += label;  m += L"\n";
     m += L"Source:      ";  m += (sf.source.empty() ? L"not found on this system" : sf.source);  m += L"\n";
     m += L"Collected:   ";  m += (sf.path.empty() ? L"(not collected)" : sf.path);  m += L"\n";
@@ -1867,6 +1378,7 @@ static void CollectSystemFile(CaptureResult* res, SysKind kind) {
                                          : L"Windows creates it only when needed") +
             L"). Nothing to collect.";
         g_log.Line(sf.error);
+        sf.absent = true;
         if (!sources.empty()) sf.source = sources[0];
         // Still write a sidecar (next to where the image would go) recording it.
         std::wstring metaPath = dst;
@@ -1950,6 +1462,85 @@ static ImagerKind DetectImagerKind(const std::wstring& imager, const std::wstrin
 }
 
 // Run the WinPmem imager to produce res->path, then hash + write meta.
+// Hashes the image while the imager is still writing it, so the finished
+// file does not have to be read a second time. Only valid for a writer that
+// appends front to back - the classic WinPmem 2.x raw writer does. Bytes are
+// read no closer than kLag to the current end of file (blocks still being
+// written are left alone), and a sudden jump in the file size (pre-allocation,
+// or a seek past a hole that might be filled in later) abandons the attempt:
+// the caller then hashes the finished file the usual way (HashFile).
+class TailHasher {
+public:
+    TailHasher(const std::wstring& path, UINT64 partSize) : m_path(path), m_hash(kBlock, partSize) {}
+    ~TailHasher() { if (m_h != INVALID_HANDLE_VALUE) CloseHandle(m_h); }
+    void Disable(const std::wstring& why) { Abandon(why); }
+    const std::wstring& Why() const { return m_why; }
+
+    // While the writer runs: hash what is safely behind it.
+    void Poll(UINT64 fileSize) {
+        if (!m_active) return;
+        if (fileSize < m_lastSize) { Abandon(L"the image file shrank while being written"); return; }
+        if (fileSize - m_lastSize > kMaxJump) {
+            Abandon(L"the image file grew by " + std::to_wstring((fileSize - m_lastSize) >> 20) +
+                    L" MB in one step");
+            return;
+        }
+        m_lastSize = fileSize;
+        if (fileSize > kLag) ReadUpTo(fileSize - kLag, kMaxPerPoll);
+    }
+
+    // After the writer exited: hash the rest. True (hashes filled in) when the
+    // whole file, finalSize bytes, went through the hasher.
+    bool Finish(UINT64 finalSize, std::string& sha, std::vector<std::string>& parts) {
+        if (!m_active) return false;
+        if (finalSize < m_lastSize) { Abandon(L"the image file shrank"); return false; }
+        ReadUpTo(finalSize, ~0ull);
+        if (!m_active) return false;
+        if (m_done != finalSize) { Abandon(L"could not read the whole image while hashing"); return false; }
+        sha = m_hash.Finish(&parts);
+        return true;
+    }
+
+private:
+    void ReadUpTo(UINT64 limit, UINT64 budget) {
+        if (m_h == INVALID_HANDLE_VALUE) {
+            m_h = CreateFileW(m_path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            if (m_h == INVALID_HANDLE_VALUE) return;   // not created yet: next poll
+        }
+        for (UINT64 read = 0; m_active && m_done < limit && read < budget;) {
+            if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) {
+                Abandon(L"stopped by user");
+                return;
+            }
+            DWORD want = (DWORD)min((UINT64)kBlock, limit - m_done), rd = 0;
+            BYTE* buf = m_hash.Acquire();
+            if (!ReadFile(m_h, buf, want, &rd, nullptr)) {
+                Abandon(L"read error " + std::to_wstring(GetLastError()));
+                return;
+            }
+            if (rd == 0) return;                       // nothing more yet
+            m_hash.Submit(rd);
+            m_done += rd;
+            read += rd;
+        }
+    }
+    void Abandon(const std::wstring& why) { if (m_active) { m_active = false; m_why = why; } }
+
+    static const DWORD  kBlock = 8 * 1024 * 1024;
+    static const UINT64 kLag = 64ull << 20;          // stay this far behind the writer
+    static const UINT64 kMaxJump = 4ull << 30;       // larger growth per poll = not appending
+    static const UINT64 kMaxPerPoll = 512ull << 20;  // keep Stop responsive
+
+    std::wstring m_path;
+    HashPipeline m_hash;
+    HANDLE       m_h = INVALID_HANDLE_VALUE;
+    bool         m_active = true;
+    std::wstring m_why;
+    UINT64       m_lastSize = 0, m_done = 0;
+};
+
 static void RunDriverCapture(CaptureResult* res) {
     bool embedded = true;
     std::wstring resolveErr;
@@ -2014,6 +1605,10 @@ static void RunDriverCapture(CaptureResult* res) {
     PostPhase(CapturePhase::Capturing, expected);
     PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)0, 0);
 
+    // Hash while the imager writes (classic WinPmem only; see TailHasher).
+    TailHasher tail(res->path, g_splitBytes);
+    if (kind != ImagerKind::Classic) tail.Disable(L"go-winpmem output is hashed after capture");
+
     // Monitor the imager. WinPmem writes progress to a console we hid; instead we
     // watch the output file grow and surface percentage while it's being written.
     UINT64 lastBytes = 0;
@@ -2038,6 +1633,7 @@ static void RunDriverCapture(CaptureResult* res) {
             if (pct > 99) pct = 99;
             PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)pct, (LPARAM)fsz);
         }
+        tail.Poll(fsz);
     }
 
     GetSystemTimeAsFileTime(&res->endUtc);   // imager done (or stopped): image data complete
@@ -2108,9 +1704,21 @@ static void RunDriverCapture(CaptureResult* res) {
                       L", image may be incomplete";
     }
 
-    // SHA-256 over the whole image (plus per-part hashes), then split if requested,
-    // then the .meta sidecar (same documentation as driverless).
-    HashFile(res);
+    // SHA-256 over the whole image (plus per-part hashes) - normally already
+    // done while the imager wrote it, else now - then split if requested, then
+    // the .meta sidecar (same documentation as driverless).
+    PostPhase(CapturePhase::Hashing, 0);
+    std::string tailSha;
+    std::vector<std::string> tailParts;
+    if (tail.Finish(produced, tailSha, tailParts)) {
+        res->sha256 = tailSha;
+        res->partSha256 = std::move(tailParts);
+        g_log.Line(L"Image SHA-256: " + Utf8ToWide(res->sha256) + L" (" + std::to_wstring(produced) +
+                   L" bytes, hashed while the imager wrote it)");
+    } else {
+        g_log.Line(L"Hashing the finished image (" + tail.Why() + L")");
+        HashFile(res);
+    }
     FinishImage(res, false);
 }
 
@@ -2606,10 +2214,49 @@ static void NormalizeNewlines(std::wstring& s) {
 
 // Show a themed modal sub window (blocks until closed).
 // Returns 1 if the primary button was pressed, 2 if the secondary.
+// Write text to whoever started RAMstain: stdout when it is redirected to a
+// file or pipe (a GUI process inherits it), else the parent's console if we
+// can attach to it (an elevated prompt). False when there is neither - e.g.
+// started from a normal prompt, where UAC runs RAMstain as a new elevated
+// process with no console. UI thread only.
+static bool ConsoleOut(const std::wstring& text) {
+    static int mode = -1;               // -1 not decided, 0 none, 1 stdout file/pipe, 2 console
+    static HANDLE h = nullptr;
+    if (mode < 0) {
+        mode = 0;
+        HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD type = (out && out != INVALID_HANDLE_VALUE) ? GetFileType(out) : FILE_TYPE_UNKNOWN;
+        if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) {
+            h = out;
+            mode = 1;
+        } else if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            h = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h != INVALID_HANDLE_VALUE) mode = 2;
+            else FreeConsole();
+        }
+    }
+    DWORD wr = 0;
+    if (mode == 1) {
+        std::string u8 = WideToUtf8(text);
+        WriteFile(h, u8.data(), (DWORD)u8.size(), &wr, nullptr);
+    } else if (mode == 2) {
+        WriteConsoleW(h, text.c_str(), (DWORD)text.size(), &wr, nullptr);
+    }
+    return mode != 0;
+}
+
 static int ShowSubWindow(int kind, const wchar_t* title, const std::wstring& bodyIn,
                          const std::wstring& primaryBtn, const std::wstring& secondBtn,
                          const std::wstring& openDir, int w, int h,
                          const std::wstring& copyText = std::wstring()) {
+    // Unattended: never block on a dialog. Report it on the console instead;
+    // a question counts as declined (callers treat 0 as cancel).
+    if (g_auto) {
+        std::wstring t = std::wstring(L"\n== ") + title + L" ==\n" + bodyIn + L"\n";
+        if (!copyText.empty()) t += L"\nSHA-256 (sha256sum format):\n" + copyText;
+        ConsoleOut(t);
+        return 0;
+    }
     std::wstring body = bodyIn;
     NormalizeNewlines(body);
     // w/h are client sizes in 96-dpi units (like all layout values); scale them
@@ -2818,9 +2465,20 @@ static void DrawMain(HDC dc, HWND hwnd) {
         SelectObject(dc, op);
     }
 
+    // Case detail fields (the edits themselves are child controls).
+    for (const auto& f : kCaseFields) {
+        HPEN op = (HPEN)SelectObject(dc, g_penEditBorder);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, g_brWhite);
+        Rectangle(dc, S(f.x), S(124), S(f.x + f.w), S(150));
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+    }
+
     // System info: two compact "label  value" lines in two columns.
     double gb = GetTotalRamGB();
+    bool memWanted = !g_chkMemory || SendMessageW(g_chkMemory, BM_GETCHECK, 0, 0) == BST_CHECKED;
     std::wstring est = g_selftest ? L"512 MB (synthetic)"
+                     : !memWanted ? L"not captured (system files only)"
                                   : (L"~" + std::to_wstring((int)gb) + L" GB  ·  4 KiB pages");
     int x1 = S(kPad), x2 = S(kCol2), lw = S(56);
     auto kv = [&](int x, int y, const wchar_t* k, const std::wstring& v) {
@@ -2828,26 +2486,26 @@ static void DrawMain(HDC dc, HWND hwnd) {
         text(v, { x + lw, y, (x == x1 ? x2 - S(8) : W - S(kPad)), y + S(18) },
              g_fBody, C.text, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
     };
-    kv(x1, S(108), L"Memory", std::to_wstring((int)gb) + L" GB");
-    kv(x2, S(108), L"Host", GetComputerName());
-    kv(x1, S(128), L"Image", est);
-    kv(x2, S(128), L"OS", GetOsVersionString());
+    kv(x1, S(158), L"Memory", std::to_wstring((int)gb) + L" GB");
+    kv(x2, S(158), L"Host", GetComputerName());
+    kv(x1, S(178), L"Image", est);
+    kv(x2, S(178), L"OS", GetOsVersionString());
 
-    hline(S(154));
+    hline(S(204));
 
-    // Options row (y 164..188): the "Split" label (g_lblSplit), combo and
+    // Options row (y 214..238): the "Split" label (g_lblSplit), combo and
     // driver checkbox are child controls.
 
     // Collect group: "COLLECT" caption (g_lblCollect) over a white rounded
-    // panel (y 214..246) holding the four checkboxes (child controls).
-    DrawRoundRect(dc, { S(kPad), S(214), W - S(kPad), S(246) }, S(6), g_brWhite, g_penEditBorder);
+    // panel (y 264..296) holding the four checkboxes (child controls).
+    DrawRoundRect(dc, { S(kPad), S(264), W - S(kPad), S(296) }, S(6), g_brWhite, g_penEditBorder);
 
     // Progress percentage (the bar itself is a child control) and status line.
     int pr = g_progress ? (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0) : 0;
-    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(256), W - S(kPad), S(274) },
+    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(306), W - S(kPad), S(324) },
          g_fBody, C.text, DT_RIGHT | DT_VCENTER);
     if (!g_status.empty())
-        text(g_status, { S(kPad), S(276), W - S(kPad), S(294) }, g_fSmall, g_statusColor,
+        text(g_status, { S(kPad), S(326), W - S(kPad), S(344) }, g_fSmall, g_statusColor,
              DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
     // Footer strip: slightly darker band with a top border; links are child
@@ -2874,10 +2532,12 @@ static void UpdateMemoryOptions(bool busy) {
     bool mem = SendMessageW(g_chkMemory, BM_GETCHECK, 0, 0) == BST_CHECKED;
     EnableWindow(g_chkDriver, mem && !busy && !g_selftest);
     EnableWindow(g_cmbSplit, mem && !busy);
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);   // the "Image" info line
 }
 
 static void SetBusy(bool busy) {
     EnableWindow(g_editPath, !busy);
+    for (HWND h : { g_editCase, g_editExaminer, g_editNotes }) EnableWindow(h, !busy);
     EnableWindow(g_btnBrowse, !busy);
     EnableWindow(g_btnCapture, !busy);
     UpdateMemoryOptions(busy);
@@ -2965,7 +2625,8 @@ static void LogRunStart(const std::wstring& path, UINT64 freeBytes) {
                L"OS:          " + GetOsVersionString() + L"\n"
                L"User:        " + user + (elevated ? L" (elevated)" : L" (not elevated)") + L"\n"
                L"Process:     PID " + std::to_wstring(GetCurrentProcessId()) + L"\n"
-               L"Command:     " + GetCommandLineW() + L"\n"
+               L"Command:     " + GetCommandLineW() + L"\n" +
+               CaseDetailsLines() +
                L"Output:      " + path + L"\n"
                L"Collect:     " + collect + L"\n"
                L"Split:       " + (g_splitBytes ? FormatGB(g_splitBytes) + L" parts" : std::wstring(L"none")) + L"\n"
@@ -3026,6 +2687,18 @@ static void OnCapture() {
         path += DefaultDumpName();
         SetTextW(g_editPath, path);
     }
+
+    // Case details: one line each (line breaks and tabs become spaces).
+    auto field = [](HWND h) {
+        std::wstring t = GetTextW(h);
+        for (wchar_t& c : t) if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+        TrimRight(t);
+        size_t b = t.find_first_not_of(L' ');
+        return b == std::wstring::npos ? std::wstring() : t.substr(b);
+    };
+    g_caseNumber = field(g_editCase);
+    g_caseExaminer = field(g_editExaminer);
+    g_caseNotes = field(g_editNotes);
 
     // What to collect. A self-test always writes its synthetic image and
     // never collects system files.
@@ -3143,7 +2816,7 @@ static void OnCapture() {
     }
 
     // One warning before we load a kernel driver (once per session).
-    if (g_driverMode && !g_driverWarned) {
+    if (g_driverMode && !g_driverWarned && !g_auto) {
         int r = ShowSubWindow(0, L"Driver mode",
             L"Driver mode will:\n"
             L"  • write the built-in WinPmem imager to a protected temporary "
@@ -3204,6 +2877,7 @@ static void OnCapture() {
     s_res.path = outPath;
     g_activeResult = &s_res;
     LogRunStart(outPath, freeB);
+    if (g_auto) ConsoleOut(L"Capturing into " + runDir + L"\n");
 
     HANDLE th = CreateThread(nullptr, 0, CaptureThreadProc, &s_res, 0, nullptr);
     if (!th) {
@@ -3306,6 +2980,24 @@ static bool HasCollectedSysFile(const CaptureResult* r) {
     return false;
 }
 
+// --auto exit code: 0 = everything requested was collected (and the image
+// hashed), 1 = something failed, was stopped, or is incomplete - including an
+// image the imager reported an error for (errCode: "may be incomplete"). A
+// system file that does not exist on this machine is not a failure.
+static int AutoExitCode(const CaptureResult* r) {
+    if (g_captureMemory && !(r->ok && !r->cancelled && !r->hashStopped && !r->sha256.empty() &&
+                             r->splitError.empty() && r->errCode == 0))
+        return 1;
+    for (SysKind k : kSysKinds) {
+        if (!SysWanted(k)) continue;
+        bool fine = false;
+        for (const SysFileCapture& f : r->sysfiles)
+            if (f.kind == k && (!f.path.empty() || f.absent)) fine = true;
+        if (!fine) return 1;
+    }
+    return 0;
+}
+
 static void OnCaptureFinished() {
     g_capturing = false;
     SetBusy(false);
@@ -3314,6 +3006,16 @@ static void OnCaptureFinished() {
     CaptureResult* r = g_activeResult;
     g_activeResult = nullptr;
     if (r) LogRunEnd(r);
+    // --auto: after the result is reported (by whichever path below), exit.
+    struct AutoExit {
+        const CaptureResult* r;
+        ~AutoExit() {
+            if (!g_auto) return;
+            g_exitCode = r ? AutoExitCode(r) : 1;
+            ConsoleOut(L"\nExit code " + std::to_wstring(g_exitCode) + L"\n");
+            DestroyWindow(g_hwnd);
+        }
+    } autoExit{ r };
     if (g_stopEvent) { CloseHandle(g_stopEvent); g_stopEvent = nullptr; }
     if (g_closeAfterStop) {           // "Stop and close": files are written, exit
         g_closeAfterStop = false;
@@ -3574,19 +3276,46 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btnBrowse = MakeButton(hwnd, L"&Browse...", S(W - kPad - kBrowseW), S(74), S(kBrowseW), S(26),
                                  BtnStyle::Secondary, (HMENU)IDC_BTN_BROWSE, g_fSmall, dpi);
 
-        // Options row (y 164..188): split drop-down after the "Split" label,
+        // Case details (y 108 caption, fields y 124..150): optional Case number,
+        // Examiner and Notes, written into every .meta sidecar and the run log.
+        // Borderless edits inside white fields drawn in DrawMain (kCaseFields);
+        // grey placeholder text names each one. "CAS&E" label: Alt+E -> Case.
+        g_lblCase = CreateWindowExW(0, L"STATIC", L"CAS&E DETAILS (OPTIONAL)",
+                                    WS_CHILD | WS_VISIBLE | WS_GROUP | SS_LEFT | SS_CENTERIMAGE,
+                                    S(kPad), S(108), S(240), S(14),
+                                    hwnd, nullptr, hInst, nullptr);
+        SendMessageW(g_lblCase, WM_SETFONT, (WPARAM)g_fLabel, TRUE);
+        {
+            struct { HWND* h; const wchar_t* cue; const std::wstring* text; int limit; } kFields[] = {
+                { &g_editCase,     L"Case number", &g_cliCase,     128 },
+                { &g_editExaminer, L"Examiner",    &g_cliExaminer, 128 },
+                { &g_editNotes,    L"Notes",       &g_cliNotes,    512 },
+            };
+            for (int f = 0; f < 3; ++f) {
+                HWND h = CreateWindowExW(0, L"EDIT", kFields[f].text->c_str(),
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | ES_AUTOHSCROLL,
+                                         S(kCaseFields[f].x + 5), S(129), S(kCaseFields[f].w - 10), S(17),
+                                         hwnd, nullptr, hInst, nullptr);
+                SendMessageW(h, WM_SETFONT, (WPARAM)g_fEdit, TRUE);
+                SendMessageW(h, EM_LIMITTEXT, kFields[f].limit, 0);
+                SendMessageW(h, EM_SETCUEBANNER, FALSE, (LPARAM)kFields[f].cue);
+                *kFields[f].h = h;
+            }
+        }
+
+        // Options row (y 214..238): split drop-down after the "Split" label,
         // driver checkbox in the second column.
         // Item data = part size in MiB (0 = no split). 4095 MiB instead of 4096
         // keeps each part under FAT32's 4 GiB file limit.
         // "Sp&lit" label (Alt+L -> drop-down).
         g_lblSplit = CreateWindowExW(0, L"STATIC", L"Sp&lit",
                                      WS_CHILD | WS_VISIBLE | WS_GROUP | SS_LEFT | SS_CENTERIMAGE,
-                                     S(kPad), S(164), S(38), S(24),
+                                     S(kPad), S(214), S(38), S(24),
                                      hwnd, nullptr, hInst, nullptr);
         SendMessageW(g_lblSplit, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         g_cmbSplit = CreateWindowExW(0, WC_COMBOBOXW, L"",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | WS_VSCROLL | CBS_DROPDOWNLIST,
-                                     S(kPad + 40), S(164), S(180), S(220),
+                                     S(kPad + 40), S(214), S(180), S(220),
                                      hwnd, (HMENU)IDC_CMB_SPLIT, hInst, nullptr);
         SendMessageW(g_cmbSplit, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         {
@@ -3612,7 +3341,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(g_cmbSplit, CB_SETCURSEL, sel, 0);
         }
         // Small round "?" right after the drop-down: how to merge split parts.
-        g_btnSplitHelp = MakeButton(hwnd, L"?", S(kPad + 40 + 180 + 6), S(166), S(20), S(20),
+        g_btnSplitHelp = MakeButton(hwnd, L"?", S(kPad + 40 + 180 + 6), S(216), S(20), S(20),
                                     BtnStyle::Help, (HMENU)IDC_BTN_SPLITHELP, g_fBody, dpi);
         if (HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
@@ -3629,21 +3358,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Default on (the driver is the primary method); --no-driver clears it.
         g_chkDriver = CreateWindowExW(0, L"BUTTON", L"Use WinPmem &driver (recommended)",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                      S(kCol2), S(165), S(W - kPad - kCol2), S(22),
+                                      S(kCol2), S(215), S(W - kPad - kCol2), S(22),
                                       hwnd, (HMENU)IDC_CHK_DRIVER, hInst, nullptr);
         SendMessageW(g_chkDriver, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkDriver, BM_SETCHECK,
                      (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        // Collect group: "COLLECT" caption (y 198, like "SAVE TO") over a white
-        // panel drawn in DrawMain (y 214..246) with four checkboxes on a 120px
+        // Collect group: "COLLECT" caption (y 248, like "SAVE TO") over a white
+        // panel drawn in DrawMain (y 264..296) with four checkboxes on a 120px
         // grid - Hibernation lines up with the driver checkbox (kCol2).
         // Unticking Memory image collects only the system files. The
         // checkboxes carry their own access keys (Alt+M, Alt+P, Alt+H, Alt+W);
         // the caption is decorative.
         g_lblCollect = CreateWindowExW(0, L"STATIC", L"COLLECT",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
-                                       S(kPad), S(198), S(200), S(14),
+                                       S(kPad), S(248), S(200), S(14),
                                        hwnd, nullptr, hInst, nullptr);
         SendMessageW(g_lblCollect, WM_SETFONT, (WPARAM)g_fLabel, TRUE);
         struct { HWND* h; const wchar_t* text; int id; bool on; } kCollect[] = {
@@ -3655,7 +3384,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (int c = 0; c < 4; ++c) {
             HWND h = CreateWindowExW(0, L"BUTTON", kCollect[c].text,
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                     S(kPad + 12 + 120 * c), S(219), S(c < 3 ? 112 : 104), S(22),
+                                     S(kPad + 12 + 120 * c), S(269), S(c < 3 ? 112 : 104), S(22),
                                      hwnd, (HMENU)(INT_PTR)kCollect[c].id, hInst, nullptr);
             SendMessageW(h, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
             SendMessageW(h, BM_SETCHECK, kCollect[c].on ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -3664,29 +3393,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EnableWindow(g_chkMemory, !g_selftest);
         UpdateMemoryOptions(false);
 
-        // Progress bar (y 262, 6px), percentage drawn to its right in DrawMain.
+        // Progress bar (y 312, 6px), percentage drawn to its right in DrawMain.
         g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
                                      WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
-                                     S(kPad), S(262), S(W - 2 * kPad - 52), S(6),
+                                     S(kPad), S(312), S(W - 2 * kPad - 52), S(6),
                                      hwnd, (HMENU)IDC_PROGRESS, hInst, nullptr);
         SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
 
-        // Action row (y 304..336): "Always on top" left, Capture + Close right.
+        // Action row (y 354..386): "Always on top" left, Capture + Close right.
         g_chkTop = CreateWindowExW(0, L"BUTTON", L"&Always on top",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                   S(kPad), S(310), S(130), S(20),
+                                   S(kPad), S(360), S(130), S(20),
                                    hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
         // Capture before Close so Tab goes left to right.
-        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(304), S(104), S(32),
+        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(354), S(104), S(32),
                                   BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
-        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(304), S(84), S(32),
+        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(354), S(84), S(32),
                                 BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
 
-        // Footer links (y 348..376 strip).
+        // Footer links (y 398..426 strip).
         g_btnDisc = MakeButton(hwnd, L"D&isclaimer", S(12), S(kFooterY + 4), S(70), S(20),
                                BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fFoot, dpi);
         g_btnPriv = MakeButton(hwnd, L"Pri&vacy Policy", S(84), S(kFooterY + 4), S(88), S(20),
@@ -3745,9 +3474,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTextColor((HDC)wp, C.secText);
             return (LRESULT)g_brBg;
         }
-        if ((HWND)lp == g_lblSave || (HWND)lp == g_lblSplit || (HWND)lp == g_lblCollect) {
+        if ((HWND)lp == g_lblSave || (HWND)lp == g_lblSplit || (HWND)lp == g_lblCollect ||
+            (HWND)lp == g_lblCase) {
             SetBkColor((HDC)wp, C.bg);
-            SetTextColor((HDC)wp, ((HWND)lp == g_lblSave || (HWND)lp == g_lblCollect) ? C.label : C.muted);
+            SetTextColor((HDC)wp, ((HWND)lp == g_lblSave || (HWND)lp == g_lblCollect || (HWND)lp == g_lblCase)
+                                     ? C.label : C.muted);
             return (LRESULT)g_brBg;
         }
         [[fallthrough]];
@@ -3913,7 +3644,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         if (g_subHwnd && IsWindow(g_subHwnd)) DestroyWindow(g_subHwnd);
-        PostQuitMessage(0);
+        PostQuitMessage(g_exitCode);
         return 0;
     case WM_ENDSESSION:
         // Logoff/shutdown can end the process without returning from the
@@ -3968,7 +3699,12 @@ static int ShowCommandLineHelp(const std::wstring& problem) {
         { L"--swapfile",               L"Also collect swapfile.sys" },
         { L"--system-files",           L"Also collect pagefile.sys, hiberfil.sys and swapfile.sys" },
         { L"--no-memory",              L"No memory image: collect the selected system files only" },
+        { L"--case \"<text>\"",         L"Case number (written into every .meta and the run log)" },
+        { L"--examiner \"<name>\"",     L"Examiner name (likewise)" },
+        { L"--notes \"<text>\"",        L"Notes (likewise)" },
         { L"--selftest [\"<out.raw>\"]", L"512 MB synthetic test capture (no real memory is read)" },
+        { L"--auto",                   L"Unattended: start at once, no dialogs, print the result and exit" },
+        { L"--verify <folder>",        L"Re-hash a capture folder (or a .meta file) against its .meta records" },
         { L"--help, -h, /?",           L"Show this help" },
     };
     std::wstring head = std::wstring(L"RAMstain ") + kVersionStr +
@@ -3979,11 +3715,16 @@ static int ShowCommandLineHelp(const std::wstring& problem) {
     const wchar_t* notes =
         L"Options only preselect the window's settings; the capture starts when you\n"
         L"click Capture. An external imager can also be set with the RAMSTAIN_WINPMEM\n"
-        L"environment variable. RAMstain runs as Administrator.\n";
+        L"environment variable. RAMstain runs as Administrator.\n\n"
+        L"Exit codes (--auto, --verify): 0 = all collected / all verified, 1 = failed or\n"
+        L"incomplete, 2 = bad option or nothing to verify, 3 = could not start,\n"
+        L"4 = RAMstain is already running.\n";
     const wchar_t* notesBox =
         L"Options only preselect the window's settings; the capture starts when you "
         L"click Capture.\n\nAn external imager can also be set with the RAMSTAIN_WINPMEM "
-        L"environment variable. RAMstain runs as Administrator.";
+        L"environment variable. RAMstain runs as Administrator.\n\n"
+        L"Exit codes (--auto, --verify): 0 = all collected / verified, 1 = failed or incomplete, "
+        L"2 = bad option or nothing to verify, 3 = could not start, 4 = already running.";
 
     // Console form: aligned columns.
     std::wstring con = L"\n" + head + usage + L"Options:\n";
@@ -3993,29 +3734,10 @@ static int ShowCommandLineHelp(const std::wstring& problem) {
     }
     con += L"\n" + std::wstring(notes);
 
-    // 1. stdout redirected to a file or pipe (inherited by a GUI process too).
-    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD type = (out && out != INVALID_HANDLE_VALUE) ? GetFileType(out) : FILE_TYPE_UNKNOWN;
-    if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) {
-        std::string u8 = WideToUtf8(con);
-        DWORD wr = 0;
-        WriteFile(out, u8.data(), (DWORD)u8.size(), &wr, nullptr);
+    // Console (redirected output or the parent's console), else a message box.
+    if (ConsoleOut(con))
         return problem.empty() ? 0 : 2;
-    }
-    // 2. The console of the prompt that started us, if we can attach to it.
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-        HANDLE hc = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr,
-                                OPEN_EXISTING, 0, nullptr);
-        if (hc != INVALID_HANDLE_VALUE) {
-            DWORD wr = 0;
-            WriteConsoleW(hc, con.c_str(), (DWORD)con.size(), &wr, nullptr);
-            CloseHandle(hc);
-            FreeConsole();
-            return problem.empty() ? 0 : 2;
-        }
-        FreeConsole();
-    }
-    // 3. Message box: proportional font, so each option gets its own line.
+    // Message box: proportional font, so each option gets its own line.
     std::wstring box = head + usage;
     for (const auto& o : kOpts)
         box += std::wstring(o.opt) + L"\n        " + o.desc + L"\n";
@@ -4030,7 +3752,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     // CLI: see ShowCommandLineHelp (RAMstain.exe --help) for the options.
     bool showHelp = false;
-    std::wstring badOption;
+    std::wstring badOption, verifyTarget;
     {
         std::wstring cmd = GetCommandLineW();
         size_t i = 0;
@@ -4055,6 +3777,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             if (_wcsicmp(t.c_str(), L"--help") == 0 || _wcsicmp(t.c_str(), L"-h") == 0 ||
                 t == L"/?" || t == L"-?") {
                 showHelp = true;
+            } else if (_wcsicmp(t.c_str(), L"--auto") == 0) {
+                g_auto = true;
+            } else if (_wcsicmp(t.c_str(), L"--verify") == 0) {
+                if (k + 1 < toks.size()) verifyTarget = toks[++k];
+                else if (badOption.empty()) badOption = t + L" (needs a folder)";
             } else if (_wcsicmp(t.c_str(), L"--selftest") == 0) {
                 g_selftest = true;
             } else if (_wcsicmp(t.c_str(), L"--driver-mode") == 0 ||
@@ -4077,6 +3804,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 g_cliCollectPagefile = true;
                 g_cliCollectHiberfil = true;
                 g_cliCollectSwapfile = true;               // all three
+            } else if (_wcsicmp(t.c_str(), L"--case") == 0 && k + 1 < toks.size()) {
+                g_cliCase = toks[++k];
+            } else if (_wcsicmp(t.c_str(), L"--examiner") == 0 && k + 1 < toks.size()) {
+                g_cliExaminer = toks[++k];
+            } else if (_wcsicmp(t.c_str(), L"--notes") == 0 && k + 1 < toks.size()) {
+                g_cliNotes = toks[++k];
             } else if (_wcsicmp(t.c_str(), L"--no-memory") == 0) {
                 g_cliNoMemory = true;                      // system files only
             } else if (_wcsicmp(t.c_str(), L"--split") == 0 && k + 1 < toks.size()) {
@@ -4097,12 +3830,30 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     if (showHelp || !badOption.empty())
         return ShowCommandLineHelp(badOption.empty() ? std::wstring()
                                                      : L"Unknown option: " + badOption);
+    // --verify <folder>: no window; results to the console, else a message box.
+    if (!verifyTarget.empty()) {
+        std::wstring all;
+        bool console = ConsoleOut(L"\n");
+        int rc = VerifyCapture(verifyTarget, [&](const std::wstring& line) {
+            all += line + L"\n";
+            if (console) ConsoleOut(line + L"\n");
+        });
+        if (!console)
+            MessageBoxW(nullptr, all.c_str(), L"RAMstain - verify",
+                        MB_OK | (rc == 0 ? MB_ICONINFORMATION : MB_ICONWARNING));
+        return rc;
+    }
 
     // Single instance, machine-wide ("Global\" covers other logon sessions too):
     // two captures loading the WinPmem driver at once would conflict. The
     // handle is kept open for the life of the process; Windows releases it on
     // exit, including a crash.
     HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, L"Global\\RAMstain.SingleInstance");
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS && g_auto) {
+        ConsoleOut(L"RAMstain is already running; only one copy can run at a time.\n");
+        CloseHandle(instanceMutex);
+        return 4;
+    }
     if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         // Bring the running copy (or its open dialog) to the front if it is in
         // this session; otherwise it is in another session - just say so.
@@ -4194,6 +3945,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     SetFocus(g_btnCapture);
     UpdateWindow(g_hwnd);
 
+    // --auto: start now. If the capture cannot start (a check failed - the
+    // reason was printed), exit with 3; otherwise OnCaptureFinished exits.
+    if (g_auto) {
+        ConsoleOut(std::wstring(L"\nRAMstain ") + kVersionStr + L" - unattended capture\n");
+        OnCapture();
+        if (!g_capturing) {
+            g_exitCode = 3;
+            ConsoleOut(L"Capture did not start. Exit code 3\n");
+            DestroyWindow(g_hwnd);
+        }
+    }
+
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         // Esc anywhere in the main window = quit (IDCANCEL: warns first if a
@@ -4209,7 +3972,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         // Key history (idle only; not while typing in the path field or
         // changing the Split selection).
         if (m.message == WM_KEYDOWN && !g_capturing &&
-            m.hwnd != g_editPath && m.hwnd != g_cmbSplit &&
+            m.hwnd != g_editPath && m.hwnd != g_cmbSplit && m.hwnd != g_editCase &&
+            m.hwnd != g_editExaminer && m.hwnd != g_editNotes &&
             (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd)) &&
             KeyRingMatch(m.wParam))
             StartHeaderAnim(g_hwnd);

@@ -5,20 +5,36 @@ rem
 rem  Builds the RAMstain application (x64) and compiles the diagnostic tools
 rem  in tools\*.c.
 rem
-rem  Usage:
+rem  Usage (arguments in any order):
 rem      build.bat              Release x64 : app + tools
 rem      build.bat Debug        Debug  x64  : app + tools
-rem      build.bat Release app  Release x64 : app only (skip tools)
+rem      build.bat app          Release x64 : app only (skip tools)
+rem      build.bat bump         bump the minor version first (for a release)
+rem
+rem  Ordinary builds do not change the version; only `bump` does.
 rem
 rem  Requires Visual Studio 2022 (Desktop development with C++).
 rem  Adjust VSDIR below if you use a different edition (Professional, etc.).
 rem ============================================================================
 setlocal
 
-set "CONFIG=%~1"
-if "%CONFIG%"=="" set "CONFIG=Release"
+set "CONFIG=Release"
 set "APPMODE=no"
-if /I "%~2"=="app" set "APPMODE=yes"
+set "BUMP=no"
+:args
+if "%~1"=="" goto argsdone
+if /I "%~1"=="Debug"   set "CONFIG=Debug"
+if /I "%~1"=="Release" set "CONFIG=Release"
+if /I "%~1"=="app"     set "APPMODE=yes"
+if /I "%~1"=="bump"    set "BUMP=yes"
+shift
+goto args
+:argsdone
+
+if /I "%BUMP%"=="yes" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\bump-version.ps1" -Header "%~dp0src\version.h"
+    if errorlevel 1 ( echo [build] Version bump FAILED. & exit /b 1 )
+)
 
 set "VSDIR=C:\Program Files\Microsoft Visual Studio\2022\Community"
 set "VCVARS=%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
