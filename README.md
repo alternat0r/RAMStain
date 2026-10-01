@@ -48,8 +48,13 @@ WinPmem.
   no dialogs, prints the result and hashes, and returns an exit code.
 - **Verify** a capture later (`--verify <folder>`): re-hashes every file
   against its `.meta`, e.g. after copying evidence to another drive.
+- **Disk-space check before collecting:** adds up what the run will write
+  (memory image, split working space, each system file) and compares it with
+  the free space. Not enough stops the run; enough but leaving the drive low
+  (under 10% left, at least 1 GB, at most 20 GB) asks before continuing,
+  with a stronger warning on the Windows drive.
 - **Safety checks:** each run in its own new folder (nothing is overwritten),
-  free-space check, and a warning if you close the window during a capture.
+  and a warning if you close the window during a capture.
 
 ## Usage
 
@@ -190,8 +195,15 @@ Tool:        RAMstain 1.42.0
 Method:      WinPmem kernel driver (WinPmem 2.x, embedded, Velocidex signed driver)
 ```
 
-The hash is computed in one pass over the image. A stopped capture keeps
-its partial image but gets no hash.
+The hash is computed in one pass over the image (with the built-in imager,
+while it is being written). A stopped capture keeps its partial image but gets
+no hash.
+
+The image is usually **larger than the installed RAM**: WinPmem pads the holes
+in the physical address space, so it runs up to the highest physical memory
+address (e.g. 34.2 GB for 31.7 GB of RAM). RAMstain reads that address from
+Windows' memory map to estimate the size for the disk-space check and the
+progress bar.
 
 ## Splitting large images
 

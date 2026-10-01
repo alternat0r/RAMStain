@@ -207,6 +207,8 @@ static bool   g_cliNoMemory = false;
 // each, may be empty) and their --case / --examiner / --notes preselects.
 static std::wstring g_caseNumber, g_caseExaminer, g_caseNotes;
 static std::wstring g_cliCase, g_cliExaminer, g_cliNotes;
+// Bytes this run is expected to write (OnCapture's disk-space check), for the log.
+static UINT64 g_plannedBytes = 0;
 
 static std::wstring g_status;        // status line text
 static COLORREF     g_statusColor;   // status line color
@@ -342,6 +344,53 @@ static double GetTotalRamGB() {
     return 0.0;
 }
 
+// Expected size of a WinPmem raw image. WinPmem pads the holes in the
+// physical address space (device memory below 4 GB, etc.), so the image runs
+// up to the highest physical RAM address - more than the installed RAM (e.g.
+// 34.2 GB of image for 31.7 GB of RAM). That address comes from the memory map
+// Windows publishes in HKLM\HARDWARE\RESOURCEMAP\System Resources\Physical
+// Memory (".Translated", a CM_RESOURCE_LIST). Falls back to the RAM size.
+static UINT64 EstimateImageBytes() {
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    UINT64 ram = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : 0;
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\RESOURCEMAP\\System Resources\\Physical Memory",
+                      0, KEY_READ, &k) != ERROR_SUCCESS)
+        return ram;
+    DWORD type = 0, cb = 0;
+    std::vector<BYTE> v;
+    if (RegQueryValueExW(k, L".Translated", nullptr, &type, nullptr, &cb) == ERROR_SUCCESS && cb >= 4) {
+        v.resize(cb);
+        if (RegQueryValueExW(k, L".Translated", nullptr, &type, v.data(), &cb) != ERROR_SUCCESS) v.clear();
+    }
+    RegCloseKey(k);
+    // CM_RESOURCE_LIST: ULONG count, then full descriptors - interface type,
+    // bus number, version/revision, ULONG count (16 bytes) - each followed by
+    // 20-byte partial descriptors: type (3 memory, 7 large memory), share,
+    // USHORT flags, then the range: 64-bit start, 32-bit length (for type 7
+    // shifted by 8, 16 or 32 bits per the flags).
+    UINT64 top = 0;
+    const BYTE* p = v.data();
+    const BYTE* end = p + v.size();
+    if (v.size() >= 4) {
+        ULONG fulls = *(const ULONG*)p;
+        p += 4;
+        for (ULONG f = 0; f < fulls && p + 16 <= end; ++f) {
+            ULONG n = *(const ULONG*)(p + 12);
+            p += 16;
+            for (ULONG i = 0; i < n && p + 20 <= end; ++i, p += 20) {
+                BYTE t = p[0];
+                USHORT flags = *(const USHORT*)(p + 2);
+                UINT64 start = *(const UINT64*)(p + 4), len = *(const ULONG*)(p + 12);
+                if (t == 7) len <<= (flags & 0x200) ? 8 : (flags & 0x400) ? 16 : (flags & 0x800) ? 32 : 0;
+                if ((t == 3 || t == 7) && start + len > top) top = start + len;
+            }
+        }
+    }
+    return top > ram ? top : ram;
+}
+
 static std::wstring GetComputerName() {
     wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1] = L"";
     DWORD n = _countof(buf);   // buffer size incl. the terminating NUL
@@ -400,12 +449,19 @@ static std::wstring FormatGB(UINT64 bytes) {
     return b;
 }
 
-// Free space on the volume containing `path`.
-// Free space for a file that will be written at path. The folders on the way
-// may not exist yet (each capture creates its own run folder, plus any missing
+// "16 MB" below 1 GB, "13.5 GB" from there (FormatGB).
+static std::wstring FormatSize(UINT64 bytes) {
+    if (bytes < (1ull << 30)) return std::to_wstring((bytes + (1ull << 20) - 1) >> 20) + L" MB";
+    return FormatGB(bytes);
+}
+
+// Free space for a file that will be written at path (and, optionally, the
+// volume's total size and root, e.g. "E:\\"). The folders on the way may not
+// exist yet (each capture creates its own run folder, plus any missing
 // parents), so measure the nearest folder that does exist - it is on the same
 // volume unless a missing folder would be a mount point, which it cannot be.
-static bool GetVolumeFreeBytes(const std::wstring& path, UINT64& freeBytes) {
+static bool GetVolumeFreeBytes(const std::wstring& path, UINT64& freeBytes,
+                               UINT64* totalBytes = nullptr, std::wstring* root = nullptr) {
     std::wstring dir = path;
     for (;;) {
         size_t sl = dir.find_last_of(L"\\/");
@@ -420,6 +476,11 @@ static bool GetVolumeFreeBytes(const std::wstring& path, UINT64& freeBytes) {
             if (!GetDiskFreeSpaceExW(probe.c_str(), &avail, &total, &totalFree))
                 return false;
             freeBytes = avail.QuadPart;
+            if (totalBytes) *totalBytes = total.QuadPart;
+            if (root) {
+                wchar_t vp[MAX_PATH] = L"";
+                *root = GetVolumePathNameW(probe.c_str(), vp, MAX_PATH) ? vp : probe;
+            }
             return true;
         }
     }
@@ -1601,7 +1662,7 @@ static void RunDriverCapture(CaptureResult* res) {
     // The image is expected to be about the size of installed RAM. WinPmem pads
     // gaps in the physical address space, so the file can end up somewhat
     // larger; the bar is held at 99% until the imager actually exits.
-    UINT64 expected = (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0);
+    UINT64 expected = EstimateImageBytes();
     PostPhase(CapturePhase::Capturing, expected);
     PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)0, 0);
 
@@ -2479,7 +2540,7 @@ static void DrawMain(HDC dc, HWND hwnd) {
     bool memWanted = !g_chkMemory || SendMessageW(g_chkMemory, BM_GETCHECK, 0, 0) == BST_CHECKED;
     std::wstring est = g_selftest ? L"512 MB (synthetic)"
                      : !memWanted ? L"not captured (system files only)"
-                                  : (L"~" + std::to_wstring((int)gb) + L" GB  ·  4 KiB pages");
+                                  : (L"~" + FormatGB(EstimateImageBytes()) + L"  ·  4 KiB pages");
     int x1 = S(kPad), x2 = S(kCol2), lw = S(56);
     auto kv = [&](int x, int y, const wchar_t* k, const std::wstring& v) {
         text(k, { x, y, x + lw, y + S(18) }, g_fSmall, C.muted, DT_LEFT | DT_VCENTER);
@@ -2630,8 +2691,8 @@ static void LogRunStart(const std::wstring& path, UINT64 freeBytes) {
                L"Output:      " + path + L"\n"
                L"Collect:     " + collect + L"\n"
                L"Split:       " + (g_splitBytes ? FormatGB(g_splitBytes) + L" parts" : std::wstring(L"none")) + L"\n"
-               L"Free space:  " + (freeBytes ? FormatGB(freeBytes) : std::wstring(L"unknown")) +
-               L" on the target volume");
+               L"Space:       ~" + FormatSize(g_plannedBytes) + L" to write, " +
+               (freeBytes ? FormatSize(freeBytes) : std::wstring(L"unknown")) + L" free on the target volume");
 }
 
 // The run's outcome, results and hashes, then close the log.
@@ -2782,38 +2843,72 @@ static void OnCapture() {
         g_splitBytes = (g_captureMemory && mb > 0 && mb != CB_ERR) ? (UINT64)mb * 1024 * 1024 : 0;
     }
 
-    // Size of the requested system files, for the disk-space check below.
-    // (These live on the system volume, but worst-case the target is the same
-    // volume; summing them is a conservative estimate.)
+    // Disk space: add up what this run will write and compare it with the free
+    // space on the target volume. Not enough -> stop; enough but leaving the
+    // volume nearly full -> warn first (more strongly on the Windows volume).
+    // (System files are measured on the source volume; worst case the target
+    // is the same volume, so summing them is conservative.)
+    UINT64 imageBytes = !g_captureMemory ? 0 : g_selftest ? 512ull << 20 : EstimateImageBytes();
+    UINT64 splitExtra = (g_splitBytes && g_splitBytes < imageBytes) ? g_splitBytes : 0;
+    const UINT64 kSidecars = 16ull << 20;              // .meta and .log files, generously
+    std::wstring plan;
+    if (imageBytes) plan += L"  Memory image:          " + FormatSize(imageBytes) + L" (estimated)\n";
+    if (splitExtra) plan += L"  Split working space:   " + FormatSize(splitExtra) + L" (temporary)\n";
     UINT64 sysBytes = 0;
-    for (SysKind k : kSysKinds)
-        if (SysWanted(k))
-            for (const auto& s : SysFileSources(k)) if (FilePresent(s)) { sysBytes += GetFileBytes(s); break; }
-
-    // Disk-space sanity check. Splitting needs room for one extra part while it
-    // moves data out of the image (see SplitImage). sysBytes is the actual size
-    // of any requested pagefile / hibernation file (already measured above).
-    UINT64 needed = g_captureMemory ? (UINT64)(GetTotalRamGB() * 1024.0 * 1024.0 * 1024.0) : 0;
-    if (g_selftest) needed = 512u * 1024 * 1024;
-    UINT64 splitExtra = (g_splitBytes && g_splitBytes < needed) ? g_splitBytes : 0;
-    UINT64 freeB = 0;
-    if (GetVolumeFreeBytes(path, freeB) &&
-        freeB < needed + splitExtra + sysBytes + (UINT64)(1024 * 1024 * 1024)) {
-        std::wstring msg = L"Not enough free disk space.\n" +
-                           (needed ? L"\nEstimated image size: " +
-                                     std::to_wstring((int)(needed / (1024 * 1024 * 1024)) + 1) +
-                                     L" GB" +
-                                     (splitExtra ? L" (+ " + FormatGB(splitExtra) + L" working space for splitting)"
-                                                 : std::wstring())
-                                   : std::wstring()) +
-                           (sysBytes ? L"\n"
-                                      L"System files: " + FormatGB(sysBytes)
-                                     : std::wstring()) +
-                           L"\nFree space on target volume: " +
-                           std::to_wstring((int)(freeB / (1024 * 1024 * 1024))) + L" GB";
-        ShowSubWindow(0, L"Not enough disk space", msg, L"OK", L"", L"", 480, 240);
-        return;
+    for (SysKind k : kSysKinds) {
+        if (!SysWanted(k)) continue;
+        UINT64 b = 0;
+        for (const auto& src : SysFileSources(k)) if (FilePresent(src)) { b = GetFileBytes(src); break; }
+        sysBytes += b;
+        plan += std::wstring(L"  ") + SysName(k) + L".sys:          " +
+                (b ? FormatSize(b) : std::wstring(L"not present")) + L"\n";
     }
+    UINT64 planned = imageBytes + splitExtra + sysBytes + kSidecars;
+    UINT64 freeB = 0, volBytes = 0;
+    std::wstring volRoot;
+    if (GetVolumeFreeBytes(path, freeB, &volBytes, &volRoot)) {
+        std::wstring sysVol = GetSystemVolume();
+        bool windowsVolume = !sysVol.empty() && _wcsicmp(volRoot.c_str(), sysVol.c_str()) == 0;
+        std::wstring summary =
+            L"This capture will write about " + FormatSize(planned) + L":\n" + plan +
+            L"\nFree space on " + volRoot + (windowsVolume ? L" (the Windows drive)" : L"") +
+            L": " + FormatSize(freeB) + L" of " + FormatSize(volBytes);
+        if (freeB < planned) {
+            ShowSubWindow(0, L"Not enough disk space",
+                L"Not enough free disk space for this capture.\n\n" + summary +
+                L"\nShort by: " + FormatSize(planned - freeB) +
+                L"\n\nFree up space, choose another drive (e.g. an external evidence "
+                L"drive), or collect less.",
+                L"OK", L"", L"", 520, 340);
+            return;
+        }
+        // "Low": under 10% of the drive left, but at least 1 GB and at most
+        // 20 GB (so a small stick is not nagged about, nor a huge disk).
+        UINT64 left = freeB - planned;
+        UINT64 lowMark = volBytes / 10;
+        if (lowMark < (1ull << 30)) lowMark = 1ull << 30;
+        if (lowMark > (20ull << 30)) lowMark = 20ull << 30;
+        bool low = left < lowMark;
+        if (low) {
+            std::wstring warn =
+                L"Free space will be low after this capture.\n\n" + summary +
+                L"\nLeft afterwards: about " + FormatSize(left) +
+                (volBytes ? L" (" + std::to_wstring((int)(left * 100 / volBytes)) + L"% of the drive)" : L"") +
+                L"\n\n" +
+                (windowsVolume
+                    ? L"This is the Windows drive: running it nearly full can make Windows "
+                      L"unstable and may fail the capture. Saving to another drive is "
+                      L"strongly recommended."
+                    : L"The capture should fit, but there is little room to spare.");
+            if (g_auto) {
+                ConsoleOut(L"\nWarning: " + warn + L"\nContinuing (unattended).\n");
+            } else if (ShowSubWindow(0, L"Low disk space", warn + L"\n\nContinue anyway?",
+                                     L"Continue", L"Cancel", L"", 520, 380) != 1) {
+                return;
+            }
+        }
+    }
+    g_plannedBytes = planned;
 
     // One warning before we load a kernel driver (once per session).
     if (g_driverMode && !g_driverWarned && !g_auto) {
