@@ -59,6 +59,7 @@
 #include "run_log.h"
 #include "ntfs_raw.h"
 #include "verify.h"
+#include "crash_dumps.h"
 #include "legal.h"
 #include "resource.h"
 #include "version.h"
@@ -91,6 +92,9 @@
 #define IDC_CHK_HIBERFIL 1014
 #define IDC_CHK_MEMORY   1015
 #define IDC_CHK_SWAPFILE 1016
+#define IDC_CHK_MINIDUMPS 1017
+#define IDC_CHK_SYSDUMP  1018
+#define IDC_CHK_APPDUMPS 1019
 
 #define IDC_SUB_TEXT     2001
 #define IDC_SUB_PRIMARY  2002
@@ -157,12 +161,12 @@ static HFONT  g_fFoot = nullptr;  // header subtitle / footer text
 
 // Main window layout, in 96-dpi pixels (scaled with Sc()). Client area is
 // kDesignW x kDesignH; see DrawMain and WM_CREATE for the rows.
-static const int kDesignW = 520, kDesignH = 426;
+static const int kDesignW = 520, kDesignH = 454;
 static const int kPad     = 16;   // outer margin
 static const int kHeaderH = 48;   // dark header band
 static const int kCol2    = 268;  // x of the second column (Host/OS, driver checkbox)
 static const int kBrowseW = 80;   // Browse button width
-static const int kFooterY = 398;  // top of the footer strip
+static const int kFooterY = 426;  // top of the footer strip
 // Case details row: Case number, Examiner, Notes (x, width).
 static const struct { int x, w; } kCaseFields[] = { { 16, 140 }, { 164, 150 }, { 322, 182 } };
 static HICON  g_hIcon = nullptr;
@@ -172,7 +176,8 @@ static HWND   g_hwnd = nullptr;
 static HWND   g_editPath, g_editCase, g_editExaminer, g_editNotes, g_lblCase, g_btnBrowse, g_btnCapture, g_btnClose, g_progress,
               g_btnDisc, g_btnPriv, g_btnTerms, g_chkTop, g_chkDriver, g_cmbSplit,
               g_btnSplitHelp, g_lblSave, g_lblSplit, g_lblCollect,
-              g_chkMemory, g_chkPagefile, g_chkHiberfil, g_chkSwapfile;
+              g_chkMemory, g_chkPagefile, g_chkHiberfil, g_chkSwapfile,
+              g_chkMinidumps, g_chkSysDump, g_chkAppDumps;
 static HWND   g_lastFocus = nullptr;    // control to refocus when the window is reactivated
 static HANDLE g_stopEvent = nullptr;
 static bool   g_capturing = false;
@@ -199,6 +204,13 @@ static bool   g_collectSwapfile = false;
 static bool   g_cliCollectPagefile = false;
 static bool   g_cliCollectHiberfil = false;
 static bool   g_cliCollectSwapfile = false;
+// Windows-created memory dumps for this run (minidumps, system crash dump,
+// app crash dumps), their --minidumps/--crash-dump/--app-dumps preselects,
+// and what OnCapture found (collected by the worker, see CollectCrashDumps).
+static bool   g_collectMinidumps = false, g_collectSysDump = false, g_collectAppDumps = false;
+static bool   g_cliMinidumps = false, g_cliSysDump = false, g_cliAppDumps = false;
+static std::vector<DumpSource>   g_dumpSources;
+static std::vector<std::wstring> g_dumpSearched;
 // Memory image for this run (off = system files only); g_cliNoMemory is the
 // --no-memory preselect for its checkbox.
 static bool   g_captureMemory = true;
@@ -254,6 +266,16 @@ struct SysFileCapture {
     bool         absent = false;     // the file does not exist on this system (nothing to collect)
 };
 
+// One Windows-created memory dump copied into <run>\crashdumps\ (CollectCrashDumps).
+struct DumpCapture {
+    DumpSource   src;
+    std::wstring rel;                // in the run folder, e.g. crashdumps\C\Windows\Minidump\x.dmp
+    std::wstring path;               // the copy (empty if not collected)
+    UINT64       bytes = 0;
+    std::string  sha256;
+    std::wstring method, error;
+};
+
 struct CaptureResult {
     bool      ok = false;
     bool      cancelled = false;         // Stop pressed during capture (partial image, no hashes)
@@ -273,6 +295,8 @@ struct CaptureResult {
     std::vector<SplitPart>   parts;  // non-empty once the image has been split
     std::wstring splitError;         // split failed part-way (image data still intact)
     std::vector<SysFileCapture> sysfiles;  // pagefile / hibernation files collected alongside
+    std::vector<DumpCapture>    dumps;     // Windows-created memory dumps collected alongside
+    std::wstring dumpsMetaPath;            // <base>__crashdumps.meta (empty if not requested)
 };
 
 static CaptureResult* g_activeResult = nullptr;
@@ -545,7 +569,7 @@ static RunLog g_log;
 // many bytes that phase expects in total (lParam, 0 = unknown); log it too.
 static void PostPhase(CapturePhase phase, UINT64 totalBytes) {
     static const wchar_t* kNames[] = { L"Capturing memory image", L"Hashing image (SHA-256)",
-                                       L"Splitting image into parts", L"Collecting system files" };
+                                       L"Splitting image into parts", L"Collecting system files / crash dumps" };
     g_log.Line(std::wstring(L"Phase: ") + kNames[(int)phase] +
                (totalBytes ? L" (" + std::to_wstring(totalBytes) + L" bytes expected)" : L""));
     PostMessageW(g_hwnd, WM_APP_PHASE, (WPARAM)phase, (LPARAM)totalBytes);
@@ -1479,6 +1503,97 @@ static void CollectSystemFiles(CaptureResult* res) {
     PostMessageW(g_hwnd, WM_APP_PROGRESS, (WPARAM)100, 0);
 }
 
+// Copy the Windows-created memory dumps OnCapture found (g_dumpSources) into
+// <run folder>\crashdumps\, keeping each one's original path below it
+// (crashdumps\C\Windows\Minidump\...), and write <base>__crashdumps.meta listing
+// every file with its source, original timestamps, size and SHA-256. The
+// manifest is written whenever dumps were requested, even if none exist, so
+// the record shows where RAMstain looked.
+static void CollectCrashDumps(CaptureResult* res) {
+    if (!g_collectMinidumps && !g_collectSysDump && !g_collectAppDumps) return;
+    PostPhase(CapturePhase::Collecting, 0);
+    std::wstring runDir = res->path.substr(0, res->path.find_last_of(L"\\/"));
+    FILETIME startUtc, endUtc;
+    GetSystemTimeAsFileTime(&startUtc);
+    g_log.Line(L"Crash dumps: " + std::to_wstring(g_dumpSources.size()) + L" found");
+    for (const DumpSource& d : g_dumpSources) {
+        DumpCapture c;
+        c.src = d;
+        // "C:\Windows\Minidump\x.dmp" -> "crashdumps\C\Windows\Minidump\x.dmp"
+        c.rel = L"crashdumps\\" + ((d.path.size() > 2 && d.path[1] == L':')
+                                    ? std::wstring(1, d.path[0]) + d.path.substr(2) : d.path);
+        std::wstring dst = runDir + L"\\" + c.rel;
+        SHCreateDirectoryExW(nullptr, dst.substr(0, dst.find_last_of(L'\\')).c_str(), nullptr);
+        SysFileCapture sf;
+        if (CopySystemFile(d.path, dst, sf)) {
+            c.path = dst;
+            c.bytes = sf.bytes;
+            c.sha256 = sf.sha256;
+            c.method = sf.method;
+            g_log.Line(std::wstring(DumpKindName(d.kind)) + L" collected: " + d.path + L" -> " + c.rel +
+                       L", " + std::to_wstring(c.bytes) + L" bytes, SHA-256 " + Utf8ToWide(c.sha256));
+        } else {
+            c.error = sf.error;
+            g_log.Line(std::wstring(DumpKindName(d.kind)) + L" NOT collected: " + d.path + L" - " + c.error);
+        }
+        res->dumps.push_back(c);
+    }
+    GetSystemTimeAsFileTime(&endUtc);
+
+    // The manifest.
+    size_t ok = 0;
+    for (const DumpCapture& c : res->dumps) if (!c.path.empty()) ++ok;
+    std::wstring requested;
+    if (g_collectMinidumps) requested += L"minidumps";
+    if (g_collectSysDump) requested += (requested.empty() ? L"" : L", ") + std::wstring(L"system crash dumps");
+    if (g_collectAppDumps) requested += (requested.empty() ? L"" : L", ") + std::wstring(L"app crash dumps");
+    std::wstring m;
+    m += L"RAMstain crash dump collection\n";
+    m += L"==============================\n";
+    m += CaseDetailsLines();
+    m += L"Host:        " + GetComputerName() + L"\n";
+    m += L"OS:          " + GetOsVersionString() + L"\n";
+    m += L"Started:     " + FormatUtcAndLocal(startUtc) + L"\n";
+    m += L"Finished:    " + FormatUtcAndLocal(endUtc) + L"\n";
+    m += L"Requested:   " + requested + L"\n";
+    for (const auto& where : g_dumpSearched) m += L"Searched:    " + where + L"\n";
+    m += L"Files:       " + std::to_wstring(ok) + L" collected, " +
+         std::to_wstring(res->dumps.size() - ok) + L" failed, of " +
+         std::to_wstring(res->dumps.size()) + L" found\n";
+    m += L"Tool:        RAMstain " + std::wstring(kVersionStr) + L"\n";
+    for (size_t i = 0; i < res->dumps.size(); ++i) {
+        const DumpCapture& c = res->dumps[i];
+        wchar_t num[16];
+        _snwprintf_s(num, _countof(num), _TRUNCATE, L"%03u", (unsigned)(i + 1));
+        m += L"File " + std::wstring(num) + L":    " + c.rel + L"\n";
+        m += L"  Kind:      " + std::wstring(DumpKindName(c.src.kind)) + L"\n";
+        m += L"  Source:    " + c.src.path + L"\n";
+        m += L"  Created:   " + FormatUtcAndLocal(c.src.created) + L"\n";
+        m += L"  Modified:  " + FormatUtcAndLocal(c.src.modified) + L"\n";
+        if (!c.path.empty()) {
+            m += L"  Size:      " + std::to_wstring(c.bytes) + L" bytes\n";
+            m += L"  SHA-256:   " + Utf8ToWide(c.sha256) + L"\n";
+            m += L"  Method:    " + c.method + L"\n";
+        } else {
+            m += L"  Error:     " + c.error + L"\n";
+        }
+    }
+    std::wstring base = res->path;
+    StripExtensionInPlace(base);
+    res->dumpsMetaPath = base + L"__crashdumps.meta";
+    std::string u = WideToUtf8(m);
+    HANDLE h = CreateFileW(res->dumpsMetaPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        WriteFile(h, u.data(), (DWORD)u.size(), &wr, nullptr);
+        CloseHandle(h);
+        g_log.Line(L"Crash dump manifest written: " + res->dumpsMetaPath);
+    } else {
+        res->dumpsMetaPath.clear();
+    }
+}
+
 // Two different WinPmem imagers ship under similar names, with different CLIs:
 //   Go imager (go-winpmem, 2023+):  go-winpmem acquire <out>   /  go-winpmem uninstall
 //   Classic C++ WinPmem (2.x):      winpmem <out>              /  winpmem -u
@@ -1804,6 +1919,8 @@ static DWORD WINAPI CaptureThreadProc(LPVOID arg) {
     // capture failed or was stopped.
     if (!g_selftest)
         CollectSystemFiles(res);
+    if (!g_selftest)
+        CollectCrashDumps(res);
 
     QueryPerformanceCounter(&t1);
     res->seconds = msPerTick > 0 ? ((double)(t1.QuadPart - t0.QuadPart) * msPerTick) / 1000.0
@@ -2558,15 +2675,15 @@ static void DrawMain(HDC dc, HWND hwnd) {
     // driver checkbox are child controls.
 
     // Collect group: "COLLECT" caption (g_lblCollect) over a white rounded
-    // panel (y 264..296) holding the four checkboxes (child controls).
-    DrawRoundRect(dc, { S(kPad), S(264), W - S(kPad), S(296) }, S(6), g_brWhite, g_penEditBorder);
+    // panel (y 264..324) holding two rows of checkboxes (child controls).
+    DrawRoundRect(dc, { S(kPad), S(264), W - S(kPad), S(324) }, S(6), g_brWhite, g_penEditBorder);
 
     // Progress percentage (the bar itself is a child control) and status line.
     int pr = g_progress ? (int)SendMessageW(g_progress, PBM_GETPOS, 0, 0) : 0;
-    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(306), W - S(kPad), S(324) },
+    text(std::to_wstring(pr) + L"%", { W - S(kPad) - S(44), S(334), W - S(kPad), S(352) },
          g_fBody, C.text, DT_RIGHT | DT_VCENTER);
     if (!g_status.empty())
-        text(g_status, { S(kPad), S(326), W - S(kPad), S(344) }, g_fSmall, g_statusColor,
+        text(g_status, { S(kPad), S(354), W - S(kPad), S(372) }, g_fSmall, g_statusColor,
              DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
     // Footer strip: slightly darker band with a top border; links are child
@@ -2606,6 +2723,7 @@ static void SetBusy(bool busy) {
     EnableWindow(g_chkPagefile, !busy);
     EnableWindow(g_chkHiberfil, !busy);
     EnableWindow(g_chkSwapfile, !busy);
+    for (HWND h : { g_chkMinidumps, g_chkSysDump, g_chkAppDumps }) EnableWindow(h, !busy);
     // Stop/Close is always clickable when entering either state; OnCloseButton
     // disables it only while a stop is in progress.
     EnableWindow(g_btnClose, TRUE);
@@ -2680,6 +2798,9 @@ static void LogRunStart(const std::wstring& path, UINT64 freeBytes) {
     add(g_collectPagefile, L"pagefile.sys");
     add(g_collectHiberfil, L"hiberfil.sys");
     add(g_collectSwapfile, L"swapfile.sys");
+    add(g_collectMinidumps, L"minidumps");
+    add(g_collectSysDump, L"system crash dumps");
+    add(g_collectAppDumps, L"app crash dumps");
     g_log.Line(std::wstring(L"==== RAMstain ") + kVersionStr + L" run started ====\n"
                L"Time:        " + FormatUtcAndLocal(FILETIME{}) + L"\n"
                L"Host:        " + GetComputerName() + L"\n"
@@ -2720,6 +2841,12 @@ static void LogRunEnd(const CaptureResult* r) {
         m += std::wstring(SysName(f.kind)) + L".sys: " +
              (!f.path.empty() ? std::to_wstring(f.bytes) + L" bytes, SHA-256 " + Utf8ToWide(f.sha256)
                               : L"not collected - " + f.error) + L"\n";
+    if (!r->dumpsMetaPath.empty() || !r->dumps.empty()) {
+        size_t ok = 0;
+        for (const DumpCapture& c : r->dumps) if (!c.path.empty()) ++ok;
+        m += L"Crash dumps: " + std::to_wstring(ok) + L" collected, " +
+             std::to_wstring(r->dumps.size() - ok) + L" failed (manifest " + r->dumpsMetaPath + L")\n";
+    }
     m += L"==== run ended ====";
     g_log.Line(m);
     g_log.Close();
@@ -2771,10 +2898,15 @@ static void OnCapture() {
         (SendMessageW(g_chkHiberfil, BM_GETCHECK, 0, 0) == BST_CHECKED);
     g_collectSwapfile = !g_selftest &&
         (SendMessageW(g_chkSwapfile, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    bool wantFiles = g_collectPagefile || g_collectHiberfil || g_collectSwapfile;
+    auto ticked = [](HWND h) { return !g_selftest && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED; };
+    g_collectMinidumps = ticked(g_chkMinidumps);
+    g_collectSysDump = ticked(g_chkSysDump);
+    g_collectAppDumps = ticked(g_chkAppDumps);
+    bool wantDumps = g_collectMinidumps || g_collectSysDump || g_collectAppDumps;
+    bool wantFiles = g_collectPagefile || g_collectHiberfil || g_collectSwapfile || wantDumps;
     if (!g_captureMemory && !wantFiles) {
         ShowSubWindow(0, L"Nothing to collect",
-                      L"Tick at least one of Memory image, Pagefile, Hibernation file or Swapfile.",
+                      L"Tick at least one item under Collect (memory image, system files or crash dumps).",
                       L"OK", L"", L"", 460, 200);
         return;
     }
@@ -2862,6 +2994,29 @@ static void OnCapture() {
         sysBytes += b;
         plan += std::wstring(L"  ") + SysName(k) + L".sys:          " +
                 (b ? FormatSize(b) : std::wstring(L"not present")) + L"\n";
+    }
+    // Memory dumps Windows wrote itself: find them now (the worker copies
+    // exactly this list) and count them in.
+    g_dumpSources.clear();
+    g_dumpSearched.clear();
+    if (wantDumps) {
+        g_dumpSources = FindCrashDumps(g_collectMinidumps, g_collectSysDump, g_collectAppDumps, &g_dumpSearched);
+        struct { DumpKind k; bool want; const wchar_t* label; } kKinds[] = {
+            { DumpKind::Minidump, g_collectMinidumps, L"Minidumps:" },
+            { DumpKind::System,   g_collectSysDump,   L"System crash dumps:" },
+            { DumpKind::App,      g_collectAppDumps,  L"App crash dumps:" },
+        };
+        for (const auto& kk : kKinds) {
+            if (!kk.want) continue;
+            size_t n = 0;
+            UINT64 b = 0;
+            for (const DumpSource& d : g_dumpSources) if (d.kind == kk.k) { ++n; b += d.bytes; }
+            std::wstring label = std::wstring(L"  ") + kk.label;
+            label.resize(25, L' ');
+            plan += label + (n ? std::to_wstring(n) + (n == 1 ? L" file, " : L" files, ") + FormatSize(b)
+                               : std::wstring(L"none found")) + L"\n";
+            sysBytes += b;
+        }
     }
     UINT64 planned = imageBytes + splitExtra + sysBytes + kSidecars;
     UINT64 freeB = 0, volBytes = 0;
@@ -3051,6 +3206,34 @@ static std::wstring SysFileSummary(const CaptureResult* r, const wchar_t* headin
     return s;
 }
 
+// Crash dump lines for the result dialogs (empty when none were requested).
+static std::wstring DumpSummary(const CaptureResult* r) {
+    if (r->dumpsMetaPath.empty() && r->dumps.empty()) return std::wstring();
+    size_t ok = 0, bad = 0;
+    UINT64 bytes = 0;
+    for (const DumpCapture& c : r->dumps) {
+        if (c.path.empty()) ++bad;
+        else { ++ok; bytes += c.bytes; }
+    }
+    std::wstring s = L"Crash dumps: ";
+    if (r->dumps.empty()) {
+        s += L"none found\n";
+    } else {
+        s += std::to_wstring(ok) + L" collected (" + FormatSize(bytes) + L") into crashdumps\\";
+        if (bad) s += L", " + std::to_wstring(bad) + L" FAILED";
+        s += L"\n";
+        const size_t kShow = 8;
+        for (size_t i = 0; i < r->dumps.size() && i < kShow; ++i) {
+            const DumpCapture& c = r->dumps[i];
+            s += L"  " + c.src.path + (c.path.empty() ? L"  - " + c.error : L"  (" + FormatSize(c.bytes) + L")") + L"\n";
+        }
+        if (r->dumps.size() > kShow)
+            s += L"  ... and " + std::to_wstring(r->dumps.size() - kShow) + L" more (all in the manifest)\n";
+    }
+    if (!r->dumpsMetaPath.empty()) s += L"Manifest: " + r->dumpsMetaPath + L"\n";
+    return s;
+}
+
 // SHA-256 of every file this run produced, one "<hash>  <file name>" line
 // each (sha256sum format, so `sha256sum -c` checks them in the output
 // folder). Empty when nothing was hashed.
@@ -3065,6 +3248,12 @@ static std::wstring HashList(const CaptureResult* r) {
     for (const SysFileCapture& f : r->sysfiles)
         if (!f.path.empty() && !f.sha256.empty())
             s += Utf8ToWide(f.sha256) + L"  " + name(f.path) + L"\n";
+    for (const DumpCapture& c : r->dumps) {             // relative path, '/' for sha256sum
+        if (c.path.empty() || c.sha256.empty()) continue;
+        std::wstring rel = c.rel;
+        for (wchar_t& ch : rel) if (ch == L'\\') ch = L'/';
+        s += Utf8ToWide(c.sha256) + L"  " + rel + L"\n";
+    }
     return s;
 }
 
@@ -3072,6 +3261,8 @@ static std::wstring HashList(const CaptureResult* r) {
 static bool HasCollectedSysFile(const CaptureResult* r) {
     for (const SysFileCapture& f : r->sysfiles)
         if (!f.path.empty()) return true;
+    for (const DumpCapture& c : r->dumps)
+        if (!c.path.empty()) return true;
     return false;
 }
 
@@ -3090,6 +3281,8 @@ static int AutoExitCode(const CaptureResult* r) {
             if (f.kind == k && (!f.path.empty() || f.absent)) fine = true;
         if (!fine) return 1;
     }
+    for (const DumpCapture& c : r->dumps)
+        if (c.path.empty()) return 1;
     return 0;
 }
 
@@ -3124,10 +3317,13 @@ static void OnCaptureFinished() {
         std::wstring dir = r->path;
         size_t sl = dir.find_last_of(L"\\/");
         if (sl != std::wstring::npos) dir = dir.substr(0, sl);
-        UpdateStatus(any ? L"Done - system files collected." : L"Collection failed.",
-                     any ? C.ok : C.danger);
-        ShowSubWindow(1, any ? L"Collection complete" : L"Collection failed",
-                      SysFileSummary(r, L"System files (no memory image requested):") +
+        bool none = r->sysfiles.empty() && r->dumps.empty();          // e.g. no dumps exist
+        UpdateStatus(any ? L"Done - files collected." : none ? L"Done - nothing found to collect."
+                                                             : L"Collection failed.",
+                     (any || none) ? C.ok : C.danger);
+        ShowSubWindow(1, any ? L"Collection complete" : none ? L"Nothing found" : L"Collection failed",
+                      L"No memory image was requested.\n\n" +
+                      SysFileSummary(r, L"System files:") + DumpSummary(r) +
                       L"\nTime:   " + FormatDuration(r->seconds) + L"\n" + LogNote() +
                       L"\nStored locally. No data was transmitted anywhere.",
                       L"Close", any ? L"Open folder" : L"", any ? dir : L"", 560, 320,
@@ -3158,7 +3354,7 @@ static void OnCaptureFinished() {
         msg += L"SHA-256: " + HashText(r, r->sha256) + L"\n";
         if (!r->method.empty())
             msg += L"Method: " + r->method + L"\n";
-        std::wstring sys = SysFileSummary(r);
+        std::wstring sys = SysFileSummary(r) + DumpSummary(r);
         if (!sys.empty()) msg += L"\n" + sys;
         if (!r->metaPath.empty())
             msg += L"\nMetadata sidecar:\n" + r->metaPath + L"\n";
@@ -3183,8 +3379,8 @@ static void OnCaptureFinished() {
             size_t sl = dir.find_last_of(L"\\/");
             if (sl != std::wstring::npos) dir = dir.substr(0, sl);
             // What was collected first; the (long) memory error after it.
-            ShowSubWindow(1, L"System files collected; memory capture failed",
-                          SysFileSummary(r, L"Collected:") +
+            ShowSubWindow(1, L"Files collected; memory capture failed",
+                          SysFileSummary(r, L"Collected:") + DumpSummary(r) +
                           L"\nThe memory image was not captured:\n" +
                           (r->error.empty() ? L"Memory capture failed." : r->error) + L"\n" + LogNote(),
                           L"Close", L"Open folder", dir, 560, 380, HashList(r));
@@ -3460,10 +3656,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      (g_driverDefault && !g_selftest) ? BST_CHECKED : BST_UNCHECKED, 0);
 
         // Collect group: "COLLECT" caption (y 248, like "SAVE TO") over a white
-        // panel drawn in DrawMain (y 264..296) with four checkboxes on a 120px
-        // grid - Hibernation lines up with the driver checkbox (kCol2).
-        // Unticking Memory image collects only the system files. The
-        // checkboxes carry their own access keys (Alt+M, Alt+P, Alt+H, Alt+W);
+        // panel drawn in DrawMain (y 264..324) with two rows of checkboxes on a
+        // 120px grid - Hibernation lines up with the driver checkbox (kCol2).
+        // Row 1: memory image and system files; row 2: memory dumps Windows
+        // wrote itself. Unticking Memory image collects only the files. The
+        // checkboxes carry their own access keys (Alt+M, P, H, W, N, Y, R);
         // the caption is decorative.
         g_lblCollect = CreateWindowExW(0, L"STATIC", L"COLLECT",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
@@ -3475,11 +3672,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             { &g_chkPagefile, L"&Pagefile",        IDC_CHK_PAGEFILE, g_cliCollectPagefile && !g_selftest },
             { &g_chkHiberfil, L"&Hibernation file", IDC_CHK_HIBERFIL, g_cliCollectHiberfil && !g_selftest },
             { &g_chkSwapfile, L"S&wapfile",        IDC_CHK_SWAPFILE, g_cliCollectSwapfile && !g_selftest },
+            { &g_chkMinidumps, L"Mi&nidumps",      IDC_CHK_MINIDUMPS, g_cliMinidumps && !g_selftest },
+            { &g_chkSysDump,  L"S&ystem crash dump", IDC_CHK_SYSDUMP, g_cliSysDump && !g_selftest },
+            { &g_chkAppDumps, L"App c&rash dumps", IDC_CHK_APPDUMPS, g_cliAppDumps && !g_selftest },
         };
-        for (int c = 0; c < 4; ++c) {
+        // Row 1 on the 120px grid; row 2: Minidumps, then "System crash dump"
+        // across two columns (too long for one), then App crash dumps.
+        static const int kX[7] = { 0, 120, 240, 360, 0, 120, 360 };
+        static const int kW[7] = { 112, 112, 112, 104, 112, 232, 116 };
+        for (int c = 0; c < 7; ++c) {
             HWND h = CreateWindowExW(0, L"BUTTON", kCollect[c].text,
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                     S(kPad + 12 + 120 * c), S(269), S(c < 3 ? 112 : 104), S(22),
+                                     S(kPad + 12 + kX[c]), S(269 + 28 * (c / 4)), S(kW[c]), S(22),
                                      hwnd, (HMENU)(INT_PTR)kCollect[c].id, hInst, nullptr);
             SendMessageW(h, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
             SendMessageW(h, BM_SETCHECK, kCollect[c].on ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -3487,30 +3691,54 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         EnableWindow(g_chkMemory, !g_selftest);
         UpdateMemoryOptions(false);
+        // Hover help: where each kind of dump is looked for.
+        if (HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                       WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                       CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                       hwnd, nullptr, hInst, nullptr)) {
+            SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, S(360));
+            struct { HWND h; const wchar_t* text; } kTips[] = {
+                { g_chkMinidumps, L"Small dumps Windows writes after a blue screen\n(%SystemRoot%\\Minidump)." },
+                { g_chkSysDump,   L"The kernel / complete dump from the last blue screen (MEMORY.DMP), "
+                                  L"live kernel reports (%SystemRoot%\\LiveKernelReports) and kernel "
+                                  L"error reports." },
+                { g_chkAppDumps,  L"Dumps of crashed programs written by Windows Error Reporting: every "
+                                  L"profile's AppData\\Local\\CrashDumps, the WER report archive and "
+                                  L"queue, and any LocalDumps folder set in the registry." },
+            };
+            for (const auto& t : kTips) {
+                TTTOOLINFOW ti = { sizeof(ti) };
+                ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+                ti.hwnd = hwnd;
+                ti.uId = (UINT_PTR)t.h;
+                ti.lpszText = (LPWSTR)t.text;
+                SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            }
+        }
 
-        // Progress bar (y 312, 6px), percentage drawn to its right in DrawMain.
+        // Progress bar (y 340, 6px), percentage drawn to its right in DrawMain.
         g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
                                      WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
-                                     S(kPad), S(312), S(W - 2 * kPad - 52), S(6),
+                                     S(kPad), S(340), S(W - 2 * kPad - 52), S(6),
                                      hwnd, (HMENU)IDC_PROGRESS, hInst, nullptr);
         SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SendMessageW(g_progress, PBM_SETBARCOLOR, 0, (LPARAM)C.accent);
 
-        // Action row (y 354..386): "Always on top" left, Capture + Close right.
+        // Action row (y 382..414): "Always on top" left, Capture + Close right.
         g_chkTop = CreateWindowExW(0, L"BUTTON", L"&Always on top",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTOCHECKBOX,
-                                   S(kPad), S(360), S(130), S(20),
+                                   S(kPad), S(388), S(130), S(20),
                                    hwnd, (HMENU)IDC_CHK_TOP, hInst, nullptr);
         SendMessageW(g_chkTop, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
         SendMessageW(g_chkTop, BM_SETCHECK, BST_UNCHECKED, 0);
         // Capture before Close so Tab goes left to right.
-        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(354), S(104), S(32),
+        g_btnCapture = MakeButton(hwnd, L"&Capture", S(W - kPad - 84 - 8 - 104), S(382), S(104), S(32),
                                   BtnStyle::Primary, (HMENU)IDC_BTN_CAPTURE, g_fBody, dpi);
-        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(354), S(84), S(32),
+        g_btnClose = MakeButton(hwnd, L"Cl&ose", S(W - kPad - 84), S(382), S(84), S(32),
                                 BtnStyle::Secondary, (HMENU)IDC_BTN_CLOSE, g_fSmall, dpi);
 
-        // Footer links (y 398..426 strip).
+        // Footer links (y 426..454 strip).
         g_btnDisc = MakeButton(hwnd, L"D&isclaimer", S(12), S(kFooterY + 4), S(70), S(20),
                                BtnStyle::Link, (HMENU)IDC_BTN_DISC, g_fFoot, dpi);
         g_btnPriv = MakeButton(hwnd, L"Pri&vacy Policy", S(84), S(kFooterY + 4), S(88), S(20),
@@ -3559,7 +3787,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORSTATIC:
         // Checkboxes and labels sit on the grey body background, not on white boxes.
         if ((HWND)lp == g_chkMemory || (HWND)lp == g_chkPagefile ||
-            (HWND)lp == g_chkHiberfil || (HWND)lp == g_chkSwapfile) {
+            (HWND)lp == g_chkHiberfil || (HWND)lp == g_chkSwapfile || (HWND)lp == g_chkMinidumps ||
+            (HWND)lp == g_chkSysDump || (HWND)lp == g_chkAppDumps) {
             SetBkColor((HDC)wp, C.white);            // inside the Collect panel
             SetTextColor((HDC)wp, C.secText);
             return (LRESULT)g_brWhite;
@@ -3686,7 +3915,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             !(g_closeAfterStop && g_phase == CapturePhase::Splitting)) {
             std::wstring s;
             if (g_phase == CapturePhase::Collecting)
-                s = L"Collecting pagefile / hibernation file...";
+                s = L"Collecting system files / crash dumps...";
             else if (g_phase == CapturePhase::Splitting)
                 s = L"Splitting image into parts...";
             else if (g_phase == CapturePhase::Hashing)
@@ -3793,7 +4022,11 @@ static int ShowCommandLineHelp(const std::wstring& problem) {
         { L"--hiberfil",               L"Also collect hiberfil.sys" },
         { L"--swapfile",               L"Also collect swapfile.sys" },
         { L"--system-files",           L"Also collect pagefile.sys, hiberfil.sys and swapfile.sys" },
-        { L"--no-memory",              L"No memory image: collect the selected system files only" },
+        { L"--minidumps",              L"Also collect minidumps (%SystemRoot%\\Minidump)" },
+        { L"--crash-dump",             L"Also collect the system crash dump (MEMORY.DMP) and live kernel reports" },
+        { L"--app-dumps",              L"Also collect app crash dumps (Windows Error Reporting)" },
+        { L"--crash-dumps",            L"All three kinds of crash dumps" },
+        { L"--no-memory",              L"No memory image: collect the selected files only" },
         { L"--case \"<text>\"",         L"Case number (written into every .meta and the run log)" },
         { L"--examiner \"<name>\"",     L"Examiner name (likewise)" },
         { L"--notes \"<text>\"",        L"Notes (likewise)" },
@@ -3905,6 +4138,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 g_cliExaminer = toks[++k];
             } else if (_wcsicmp(t.c_str(), L"--notes") == 0 && k + 1 < toks.size()) {
                 g_cliNotes = toks[++k];
+            } else if (_wcsicmp(t.c_str(), L"--minidumps") == 0) {
+                g_cliMinidumps = true;
+            } else if (_wcsicmp(t.c_str(), L"--crash-dump") == 0) {
+                g_cliSysDump = true;
+            } else if (_wcsicmp(t.c_str(), L"--app-dumps") == 0) {
+                g_cliAppDumps = true;
+            } else if (_wcsicmp(t.c_str(), L"--crash-dumps") == 0) {
+                g_cliMinidumps = g_cliSysDump = g_cliAppDumps = true;   // all three
             } else if (_wcsicmp(t.c_str(), L"--no-memory") == 0) {
                 g_cliNoMemory = true;                      // system files only
             } else if (_wcsicmp(t.c_str(), L"--split") == 0 && k + 1 < toks.size()) {
@@ -4082,7 +4323,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         // manager below only moves focus to a checkbox for its access key.)
         if (m.message == WM_SYSCHAR && (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd))) {
             HWND hit = nullptr;
-            for (HWND c : { g_chkTop, g_chkDriver, g_chkMemory, g_chkPagefile, g_chkHiberfil, g_chkSwapfile }) {
+            for (HWND c : { g_chkTop, g_chkDriver, g_chkMemory, g_chkPagefile, g_chkHiberfil, g_chkSwapfile,
+                              g_chkMinidumps, g_chkSysDump, g_chkAppDumps }) {
                 wchar_t t[128] = L"";
                 GetWindowTextW(c, t, 128);
                 const wchar_t* amp = wcschr(t, L'&');

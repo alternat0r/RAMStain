@@ -124,11 +124,13 @@
     <ClInclude Include="src\ntfs_raw.h" />
     <ClInclude Include="src\sha256.h" />
     <ClInclude Include="src\verify.h" />
+    <ClInclude Include="src\crash_dumps.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\RAMstain.cpp" />
     <ClCompile Include="src\ntfs_raw.cpp" />
     <ClCompile Include="src\verify.cpp" />
+    <ClCompile Include="src\crash_dumps.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\ramstain.rc" />

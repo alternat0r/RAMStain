@@ -42,6 +42,9 @@ WinPmem.
 - **Pagefile / hibernation file / swapfile collection:** optionally collect
   `pagefile.sys`, `hiberfil.sys` and `swapfile.sys` alongside the memory image,
   or on their own, each with its own SHA-256 and `.meta` sidecar.
+- **Crash dump collection:** minidumps, the system crash dump (`MEMORY.DMP`)
+  and live kernel reports, and app crash dumps written by Windows Error
+  Reporting - copied with their original paths, timestamps and SHA-256.
 - **Case details:** optional case number, examiner and notes, written into
   every `.meta` sidecar and the run log.
 - **Unattended mode** (`--auto`) for remote incident response: starts at once,
@@ -99,6 +102,7 @@ with **Alt**:
 | Alt+P | Collect pagefile.sys |
 | Alt+H | Collect hiberfil.sys |
 | Alt+W | Collect swapfile.sys |
+| Alt+N / Alt+Y / Alt+R | Collect minidumps / system crash dump / app crash dumps |
 | Alt+A | Always on top |
 | Alt+I / Alt+V / Alt+U | Disclaimer / Privacy Policy / Terms of Use |
 | F1 | About |
@@ -117,6 +121,10 @@ RAMstain.exe --pagefile                   also collect pagefile.sys
 RAMstain.exe --hiberfil                   also collect hiberfil.sys
 RAMstain.exe --swapfile                   also collect swapfile.sys
 RAMstain.exe --system-files               also collect pagefile, hibernation file and swapfile
+RAMstain.exe --minidumps                  also collect minidumps
+RAMstain.exe --crash-dump                 also collect MEMORY.DMP and live kernel reports
+RAMstain.exe --app-dumps                  also collect app crash dumps (Windows Error Reporting)
+RAMstain.exe --crash-dumps                all three kinds of crash dumps
 RAMstain.exe --no-memory --system-files   system files only, no memory image
 RAMstain.exe --case "2026-042" --examiner "J. Doe" --notes "..."   case details
 RAMstain.exe --auto ...                   unattended: start at once, no dialogs, exit with a code
@@ -176,6 +184,7 @@ All files of a run are in its `RAMstain_<YYYYMMDD_HHMMSS>` folder.
 | `<name>__pagefile.raw` + `.meta` | Collected pagefile (if requested), with its own size, SHA-256 and source path. |
 | `<name>__hiberfil.raw` + `.meta` | Collected hibernation file (if requested), same sidecar format. |
 | `<name>__swapfile.raw` + `.meta` | Collected swapfile (if requested), same sidecar format. |
+| `crashdumps\...` + `<name>__crashdumps.meta` | Collected crash dumps (if requested), each under its original path (e.g. `crashdumps\C\Windows\Minidump\...`). The manifest lists every location searched and, per file, its kind, source path, original created/modified times, size and SHA-256. |
 
 Example `host1.meta`:
 
@@ -252,6 +261,28 @@ apply. The files are named after the save path, e.g. `host1__pagefile.raw`.
   collected (and reported) even if the memory image itself fails or is
   stopped. Stopping during collection discards the partial system file.
 
+## Collecting crash dumps
+
+The second row of the **Collect** group (or `--minidumps`, `--crash-dump`,
+`--app-dumps`, `--crash-dumps`) copies the memory dumps Windows wrote itself.
+Hover over a checkbox to see where it looks.
+
+| Option | Looks in |
+|--------|----------|
+| **Minidumps** | `CrashControl\MinidumpDir` (default `%SystemRoot%\Minidump`) |
+| **System crash dump** | `CrashControl\DumpFile` (default `%SystemRoot%\MEMORY.DMP`), `%SystemRoot%\LiveKernelReports`, and kernel (`Kernel_*`) Windows Error Reporting reports |
+| **App crash dumps** | every profile's `AppData\Local\CrashDumps` (users, plus the system and service accounts), the Windows Error Reporting report archive and queue (machine-wide and per user), and any `LocalDumps` `DumpFolder` set in the registry |
+
+`.dmp`, `.mdmp` and `.hdmp` files are collected; junctions are not followed.
+Each copy keeps its original path under the run folder's `crashdumps\`, so
+same-named dumps from different places cannot collide, and the manifest
+records where RAMstain looked even when nothing was found ("none found" is not
+an error). Dumps are counted in the disk-space check, listed by **Copy
+hashes** (by relative path) and checked by `--verify`.
+
+App crash dumps contain the memory of the crashed program - treat them as
+sensitive as the memory image.
+
 ## How it captures
 
 Reading physical memory on Windows requires a kernel driver. RAMstain uses the
@@ -312,8 +343,8 @@ RAMstain is built on **[WinPmem](https://github.com/Velocidex/WinPmem)**, the
 open-source Windows memory imager by **Michael Cohen**, maintained by
 **[Velocidex](https://github.com/Velocidex)**. WinPmem does the actual work of
 reading physical memory through its signed kernel driver; RAMstain adds the
-interface, integrity hashing, evidence sidecar, run log, image splitting and
-system-file collection.
+interface, integrity hashing, evidence sidecar, run log, image splitting,
+system-file and crash dump collection.
 
 The embedded imager is WinPmem 2.0.1, signed by Velocidex Innovations, and is
 included unmodified under the [Apache License 2.0](third_party/winpmem/LICENSE)

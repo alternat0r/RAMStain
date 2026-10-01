@@ -82,6 +82,27 @@ std::vector<Item> ParseMeta(const std::wstring& metaPath) {
     if (lines.empty()) return items;
     bool capture = lines[0].find(L"capture metadata") != std::wstring::npos;
     bool sysfile = lines[0].find(L"system file metadata") != std::wstring::npos;
+    bool dumps   = lines[0].find(L"crash dump collection") != std::wstring::npos;
+
+    // Crash dump manifest: "File 001:    crashdumps\C\...\x.dmp" (relative to
+    // the manifest's folder), then indented details incl. "  SHA-256:   <hash>".
+    if (dumps) {
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const std::wstring& l = lines[i];
+            if (l.size() < 6 || l.compare(0, 5, L"File ") != 0 || !iswdigit(l[5])) continue;
+            Item it;
+            std::wstring rel = Trim(l.substr(l.find(L':') + 1));
+            it.label = rel;
+            it.files = { dir + L"\\" + rel };
+            std::wstring sha, v;
+            for (size_t j = i + 1; j < lines.size() && lines[j].compare(0, 2, L"  ") == 0; ++j)
+                if (Field(Trim(lines[j]), L"SHA-256:", v)) sha = v;
+            if (IsSha(sha)) it.sha = Lower(sha);
+            else it.note = L"not collected (see the manifest)";
+            items.push_back(it);
+        }
+        return items;
+    }
     if (!capture && !sysfile) return items;
 
     std::wstring file, sha, v;
@@ -148,9 +169,12 @@ void FindMetas(const std::wstring& dir, std::vector<std::wstring>& metas, bool d
     for (const auto& d : subdirs) FindMetas(d, metas, false);
 }
 
-std::wstring Gb(UINT64 b) {
+std::wstring Gb(UINT64 b) {                    // "16 MB" below 1 GB, else "13.50 GB"
     wchar_t buf[32];
-    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.2f GB", b / (1024.0 * 1024.0 * 1024.0));
+    if (b < (1ull << 30))
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%llu MB", (b + (1ull << 20) - 1) >> 20);
+    else
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.2f GB", b / (1024.0 * 1024.0 * 1024.0));
     return buf;
 }
 
